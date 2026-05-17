@@ -1,9 +1,9 @@
-# 在桌上养一只宠物：Clawdmeter 开发笔记
+# 在桌上养一只宠物：CodePet 开发笔记
 
 > 一块 480×480 的 AMOLED 小屏，放在桌上盯着我的 Claude Code 用量。
 > 这篇记录一次开发会话——从把设备跑起来到加了三块新屏。
 
-Clawdmeter 跑在 **Waveshare ESP32-S3-Touch-AMOLED-2.16** 上：开发板
+CodePet 跑在 **Waveshare ESP32-S3-Touch-AMOLED-2.16** 上：开发板
 通过蓝牙和电脑上的守护进程配对，守护进程轮询 Anthropic API 拿用量
 数据推到屏上。
 

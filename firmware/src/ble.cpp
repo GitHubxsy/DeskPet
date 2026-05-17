@@ -3,7 +3,7 @@
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
 
-#define DEVICE_NAME "Claude Controller"
+#define DEVICE_NAME "Clawdmeter"
 
 // Custom GATT UUIDs for data channel
 #define SERVICE_UUID        "4c41555a-4465-7669-6365-000000000001"
@@ -59,18 +59,25 @@ static void start_advertising() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->reset();
     adv->addServiceUUID(SERVICE_UUID);
+    if (hid_dev) {
+        adv->addServiceUUID(hid_dev->getHidService()->getUUID());
+    }
     adv->setAppearance(HID_KEYBOARD);
     adv->enableScanResponse(true);
     adv->setName(DEVICE_NAME);
     bool ok = adv->start();
-    state = BLE_STATE_ADVERTISING;
+    if (state != BLE_STATE_CONNECTED) state = BLE_STATE_ADVERTISING;
     Serial.printf("BLE: advertising start=%s\n", ok ? "OK" : "FAILED");
 }
 
 class ServerCallbacks : public NimBLEServerCallbacks {
     void onConnect(NimBLEServer* s, NimBLEConnInfo& info) override {
         state = BLE_STATE_CONNECTED;
-        Serial.printf("BLE: connected from %s\n", info.getAddress().toString().c_str());
+        Serial.printf("BLE: connected from %s (count=%u)\n",
+                      info.getAddress().toString().c_str(), s->getConnectedCount());
+        // Keep advertising after the first central connects so a second
+        // central (the usage daemon) can also discover and connect.
+        if (s->getConnectedCount() < 3) need_advertise = true;
     }
 
     void onDisconnect(NimBLEServer* s, NimBLEConnInfo& info, int reason) override {
@@ -151,7 +158,6 @@ void ble_init(void) {
     static ReqCallbacks reqCb;
     req_char->setCallbacks(&reqCb);
 
-    svc->start();
     server->start();
     start_advertising();
 

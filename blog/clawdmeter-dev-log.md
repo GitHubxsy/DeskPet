@@ -67,14 +67,12 @@ JSON 协议扩了两个字段：当天秒数 `t` 和预格式化的日期串 `d`
 
 ## 成果
 
-这次会话从「设备拆箱」做到了三块可用的新屏：
+这次会话给设备做出了几块屏：
 
-| 屏幕 | 内容 |
-|------|------|
-| ![Splash](images/splash.png) | 像素画 Clawd 动画 |
-| ![Usage](images/usage.png) | session / weekly 用量条 |
-| ![Countdown](images/countdown.png) | 重置倒计时 + 同心进度环 |
-| ![Clock](images/clock.png) | 主机时间 + 日期 |
+- **Splash** —— 像素画 Clawd 动画
+- **Usage** —— session / weekly 用量条
+- **Countdown** —— 重置倒计时 + 同心进度环
+- **Clock** —— 主机时间 + 日期
 
 按中间键在 Usage → Countdown → Clock 间循环，点屏幕切回 splash 动画。
 

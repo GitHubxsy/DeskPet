@@ -2,7 +2,7 @@
 """Claude Usage Tracker Daemon (BLE) — macOS port of claude-usage-daemon.sh.
 
 Polls Claude API rate-limit headers and writes a JSON payload to the
-ESP32 "Claude Controller" peripheral over a custom GATT service. Uses
+ESP32 "Clawdmeter" peripheral over a custom GATT service. Uses
 bleak (CoreBluetooth backend on macOS).
 """
 
@@ -21,7 +21,7 @@ import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
-DEVICE_NAME = "Claude Controller"
+DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
 REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
@@ -186,12 +186,15 @@ async def poll_api(token: str) -> dict | None:
         except ValueError:
             return 0
 
+    lt = time.localtime(now)
     payload = {
         "s": pct(hdr("anthropic-ratelimit-unified-5h-utilization")),
         "sr": reset_minutes(hdr("anthropic-ratelimit-unified-5h-reset")),
         "w": pct(hdr("anthropic-ratelimit-unified-7d-utilization")),
         "wr": reset_minutes(hdr("anthropic-ratelimit-unified-7d-reset")),
         "st": hdr("anthropic-ratelimit-unified-5h-status", "unknown"),
+        "t": lt.tm_hour * 3600 + lt.tm_min * 60 + lt.tm_sec,
+        "d": time.strftime("%a, %d %b %Y", lt),
         "ok": True,
     }
     return payload

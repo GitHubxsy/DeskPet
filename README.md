@@ -14,12 +14,12 @@ The Clawd animations come from [claudepix](https://claudepix.vercel.app), [@amaa
 
 ## Screens
 
-The device boots into the splash and stays there until you press the middle (PWR) button, which cycles between Usage and Bluetooth. Tap the screen anywhere (except the Reset zone on the Bluetooth screen) to flip back to the splash; tap again to dismiss it.
+The device boots into the splash and stays there until you press the middle (PWR) button, which cycles through Usage, Countdown, and Clock. Tap the screen anywhere to flip back to the splash; tap again to dismiss it.
 
-|              Splash               |              Usage              |                Bluetooth                |
-| :-------------------------------: | :-----------------------------: | :-------------------------------------: |
-| ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png) | ![Bluetooth](screenshots/bluetooth.png) |
-|   Splash; touch-toggle anytime    | Session and weekly utilization  |    Connection status and bond reset     |
+|              Splash               |              Usage              |                 Countdown                  |              Clock              |
+| :-------------------------------: | :------------------------------: | :-----------------------------------------: | :------------------------------: |
+| ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png)  | ![Countdown](screenshots/countdown.png)     | ![Clock](screenshots/clock.png)  |
+|   Splash; touch-toggle anytime    |  Session and weekly utilization  | Session reset countdown + session/week rings | Host time, ambient display       |
 
 While the splash is up, the middle button cycles animations instead of screens. The firmware also auto-rotates every 20 s within the current usage-rate group, so a long stretch on the splash isn't just one Clawd on loop.
 
@@ -82,18 +82,18 @@ pio run -t upload --upload-port /dev/ttyACM0
 
 ### Pair the device
 
-After flashing, the device advertises as "Claudemeter". Pair it once:
+After flashing, the device advertises as "Clawdmeter". Pair it once:
 
 ```bash
 # Scan for the device
 bluetoothctl scan le
 
-# When "Claude Controller" appears, pair and trust it
+# When "Clawdmeter" appears, pair and trust it
 bluetoothctl pair F4:12:FA:C0:8F:E5    # use your device's MAC
 bluetoothctl trust F4:12:FA:C0:8F:E5
 ```
 
-The MAC address is shown on the Bluetooth screen — press the middle (PWR) button to cycle to it.
+Find the device's MAC with `bluetoothctl scan le` — it advertises as "Clawdmeter".
 
 ### Install the daemon
 
@@ -125,7 +125,7 @@ The board has three side buttons. Left and right do the same thing on every scre
 | Button           | GPIO         | Function                                                       |
 | ---------------- | ------------ | -------------------------------------------------------------- |
 | **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)       |
-| **Middle** (PWR) | AXP2101 PKEY | Cycle screens (Usage ↔ Bluetooth); on splash, cycle animations |
+| **Middle** (PWR) | AXP2101 PKEY | Cycle screens (Usage → Countdown → Clock); on splash, cycle animations |
 | **Right**        | GPIO 18      | Press to send Shift+Tab (Claude Code mode toggle)              |
 
 Space and Shift+Tab go out as standard BLE HID keyboard reports, so they trigger in whatever window has focus on the paired host — not just Claude Code.
@@ -144,10 +144,10 @@ The device advertises a custom GATT service alongside the standard HID keyboard 
 JSON payload format (written to RX):
 
 ```json
-{ "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "ok": true }
+{ "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "t": 52380, "d": "Sat, 17 May 2026", "ok": true }
 ```
 
-Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `ok` = success flag.
+Fields: `s` = session %, `sr` = session reset (minutes), `w` = weekly %, `wr` = weekly reset (minutes), `st` = status, `t` = host local time (seconds since midnight), `d` = host local date string, `ok` = success flag.
 
 ## Recompiling fonts
 

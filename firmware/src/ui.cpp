@@ -12,6 +12,8 @@ LV_FONT_DECLARE(font_styrene_28);
 LV_FONT_DECLARE(font_styrene_24);
 LV_FONT_DECLARE(font_styrene_20);
 LV_FONT_DECLARE(font_mono_32);
+LV_FONT_DECLARE(font_mono_64);
+LV_FONT_DECLARE(font_mono_96);
 
 // Anthropic brand palette — design tokens live in theme.h
 #include "theme.h"
@@ -46,11 +48,36 @@ static lv_obj_t* lbl_weekly_label;
 static lv_obj_t* lbl_weekly_reset;
 static lv_obj_t* lbl_anim;
 
-// ---- Bluetooth screen widgets ----
-static lv_obj_t* ble_container;
-static lv_obj_t* lbl_ble_status;
-static lv_obj_t* lbl_ble_device;
-static lv_obj_t* lbl_ble_mac;
+// ---- Countdown screen widgets ----
+static lv_obj_t* countdown_container;
+static lv_obj_t* countdown_arc;        // inner ring — session reset progress
+static lv_obj_t* countdown_week_arc;   // outer ring — weekly consumption
+static lv_obj_t* lbl_countdown_caption;
+static lv_obj_t* lbl_countdown_big;
+static lv_obj_t* lbl_countdown_pct;    // session utilization legend
+static lv_obj_t* lbl_countdown_week;   // weekly utilization legend
+
+// Session rate-limit window length — denominator for the progress ring.
+#define SESSION_WINDOW_MIN  300   // 5-hour unified window
+
+// Countdown state. countdown_target_ms is the lv_tick value at which the
+// session resets; the screen decrements locally each second between polls.
+static uint32_t countdown_target_ms = 0;
+static bool     countdown_valid = false;
+static int      countdown_last_shown = -99999;  // last whole-second value rendered
+
+// ---- Clock screen widgets ----
+static lv_obj_t* clock_container;
+static lv_obj_t* lbl_clock_date;   // weekday + date
+static lv_obj_t* lbl_clock_time;   // big HH:MM
+static lv_obj_t* lbl_clock_secs;   // small SS
+
+// Clock state. The host sends its local time (seconds since midnight) on
+// each poll; the screen advances locally each second between polls.
+static int      clock_base_secs = 0;
+static uint32_t clock_base_ms = 0;
+static bool     clock_valid = false;
+static int      clock_last_shown = -1;
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -138,7 +165,6 @@ static void format_reset_time(int mins, char* buf, size_t len) {
 
 // Forward decls — callbacks defined near ui_show_screen below
 static void global_click_cb(lv_event_t* e);
-static void ble_reset_click_cb(lv_event_t* e);
 
 static lv_obj_t* make_panel(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_t* panel = lv_obj_create(parent);
@@ -172,15 +198,6 @@ static lv_obj_t* make_bar(lv_obj_t* parent, int x, int y, int w, int h) {
     lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, LV_PART_INDICATOR);
     lv_obj_set_style_radius(bar, 6, LV_PART_INDICATOR);
     return bar;
-}
-
-static void init_icon_dsc(lv_image_dsc_t* dsc, int w, int h, const uint16_t* data) {
-    dsc->header.w = w;
-    dsc->header.h = h;
-    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
-    dsc->header.stride = w * 2;
-    dsc->data = (const uint8_t*)data;
-    dsc->data_size = w * h * 2;
 }
 
 // RGB565A8: planar — w*h RGB565 pixels followed by w*h alpha bytes.
@@ -279,93 +296,116 @@ static void init_usage_screen(lv_obj_t* scr) {
     lv_obj_align(lbl_anim, LV_ALIGN_BOTTOM_MID, 0, -15);
 }
 
-// ======== Bluetooth Screen (480x480) ========
+// ======== Clock Screen (480x480) ========
 
-static void init_bluetooth_screen(lv_obj_t* scr) {
-    ble_container = lv_obj_create(scr);
-    lv_obj_set_size(ble_container, SCR_W, SCR_H);
-    lv_obj_set_pos(ble_container, 0, 0);
-    lv_obj_set_style_bg_opa(ble_container, LV_OPA_TRANSP, 0);
-    lv_obj_set_style_border_width(ble_container, 0, 0);
-    lv_obj_set_style_pad_all(ble_container, 0, 0);
-    lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_SCROLLABLE);
+static void init_clock_screen(lv_obj_t* scr) {
+    clock_container = lv_obj_create(scr);
+    lv_obj_set_size(clock_container, SCR_W, SCR_H);
+    lv_obj_set_pos(clock_container, 0, 0);
+    lv_obj_set_style_bg_opa(clock_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(clock_container, 0, 0);
+    lv_obj_set_style_pad_all(clock_container, 0, 0);
+    lv_obj_clear_flag(clock_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(clock_container, global_click_cb, LV_EVENT_CLICKED, NULL);
 
-    // Title
-    lv_obj_t* lbl_ble_title = lv_label_create(ble_container);
-    lv_label_set_text(lbl_ble_title, "Bluetooth");
-    lv_obj_set_style_text_font(lbl_ble_title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(lbl_ble_title, COL_TEXT, 0);
-    lv_obj_align(lbl_ble_title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+    lbl_clock_date = lv_label_create(clock_container);
+    lv_label_set_text(lbl_clock_date, "");
+    lv_obj_set_style_text_font(lbl_clock_date, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_clock_date, COL_DIM, 0);
+    lv_obj_align(lbl_clock_date, LV_ALIGN_CENTER, 0, -96);
 
-    // Info panel (taller for 480x480)
-    lv_obj_t* p_info = make_panel(ble_container, MARGIN, CONTENT_Y, CONTENT_W, 160);
+    lbl_clock_time = lv_label_create(clock_container);
+    lv_label_set_text(lbl_clock_time, "--:--");
+    lv_obj_set_style_text_font(lbl_clock_time, &font_mono_96, 0);
+    lv_obj_set_style_text_color(lbl_clock_time, COL_TEXT, 0);
+    lv_obj_align(lbl_clock_time, LV_ALIGN_CENTER, 0, -6);
 
-    // Bluetooth icon + status row
-    static lv_image_dsc_t icon_bt_dsc;
-    init_icon_dsc(&icon_bt_dsc, ICON_BLUETOOTH_W, ICON_BLUETOOTH_H, icon_bluetooth_data);
-
-    lv_obj_t* bt_img = lv_image_create(p_info);
-    lv_image_set_src(bt_img, &icon_bt_dsc);
-    lv_obj_set_pos(bt_img, 0, 0);
-
-    lbl_ble_status = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_status, "Initializing...");
-    lv_obj_set_style_text_font(lbl_ble_status, &font_styrene_48, 0);
-    lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_status, 56, 2);
-
-    lbl_ble_device = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_device, "Device: ---");
-    lv_obj_set_style_text_font(lbl_ble_device, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(lbl_ble_device, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_device, 0, 64);
-
-    lbl_ble_mac = lv_label_create(p_info);
-    lv_label_set_text(lbl_ble_mac, "Address: ---");
-    lv_obj_set_style_text_font(lbl_ble_mac, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(lbl_ble_mac, COL_DIM, 0);
-    lv_obj_set_pos(lbl_ble_mac, 0, 100);
-
-    // Reset Bluetooth tap zone with trash icon
-    int reset_y = CONTENT_Y + 160 + 16;
-    lv_obj_t* reset_zone = lv_obj_create(ble_container);
-    lv_obj_set_pos(reset_zone, MARGIN, reset_y);
-    lv_obj_set_size(reset_zone, CONTENT_W, 110);
-    lv_obj_set_style_bg_color(reset_zone, COL_PANEL, 0);
-    lv_obj_set_style_bg_opa(reset_zone, LV_OPA_COVER, 0);
-    lv_obj_set_style_radius(reset_zone, 8, 0);
-    lv_obj_set_style_border_width(reset_zone, 0, 0);
-    lv_obj_set_style_pad_column(reset_zone, 14, 0);
-    lv_obj_set_flex_flow(reset_zone, LV_FLEX_FLOW_ROW);
-    lv_obj_set_flex_align(reset_zone, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER, LV_FLEX_ALIGN_CENTER);
-    lv_obj_clear_flag(reset_zone, LV_OBJ_FLAG_SCROLLABLE);
-    lv_obj_add_event_cb(reset_zone, ble_reset_click_cb, LV_EVENT_CLICKED, NULL);
-
-    static lv_image_dsc_t icon_trash_dsc;
-    init_icon_dsc(&icon_trash_dsc, ICON_TRASH2_W, ICON_TRASH2_H, icon_trash2_data);
-    lv_obj_t* trash_img = lv_image_create(reset_zone);
-    lv_image_set_src(trash_img, &icon_trash_dsc);
-
-    lv_obj_t* reset_lbl = lv_label_create(reset_zone);
-    lv_label_set_text(reset_lbl, "Reset Bluetooth");
-    lv_obj_set_style_text_font(reset_lbl, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(reset_lbl, COL_DIM, 0);
+    lbl_clock_secs = lv_label_create(clock_container);
+    lv_label_set_text(lbl_clock_secs, "--");
+    lv_obj_set_style_text_font(lbl_clock_secs, &font_mono_32, 0);
+    lv_obj_set_style_text_color(lbl_clock_secs, COL_DIM, 0);
+    lv_obj_align(lbl_clock_secs, LV_ALIGN_CENTER, 0, 66);
 
     // Attribution
-    lv_obj_t* lbl_credit = lv_label_create(ble_container);
-    lv_label_set_text(lbl_credit, "Built by @hermannbjorgvin");
+    lv_obj_t* lbl_credit = lv_label_create(clock_container);
+    lv_label_set_text(lbl_credit, "built by xieshiyi");
     lv_obj_set_style_text_font(lbl_credit, &font_styrene_24, 0);
     lv_obj_set_style_text_color(lbl_credit, COL_DIM, 0);
-    lv_obj_align(lbl_credit, LV_ALIGN_BOTTOM_MID, 0, -46);
+    lv_obj_align(lbl_credit, LV_ALIGN_BOTTOM_MID, 0, -24);
 
-    lv_obj_t* lbl_credit2 = lv_label_create(ble_container);
-    lv_label_set_text(lbl_credit2, "Clawd animation by @amaanbuilds");
-    lv_obj_set_style_text_font(lbl_credit2, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(lbl_credit2, COL_DIM, 0);
-    lv_obj_align(lbl_credit2, LV_ALIGN_BOTTOM_MID, 0, -20);
+    lv_obj_add_flag(clock_container, LV_OBJ_FLAG_HIDDEN);
+}
 
-    // Start hidden
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
+// ======== Countdown Screen (480x480) ========
+
+// A full-circle progress ring. range 0..1000, starts at 12 o'clock.
+static lv_obj_t* make_ring(lv_obj_t* parent, int diameter, int track_w,
+                           lv_color_t indic_color, int y_offset) {
+    lv_obj_t* arc = lv_arc_create(parent);
+    lv_obj_set_size(arc, diameter, diameter);
+    lv_obj_align(arc, LV_ALIGN_CENTER, 0, y_offset);
+    lv_arc_set_rotation(arc, 270);
+    lv_arc_set_bg_angles(arc, 0, 360);
+    lv_arc_set_range(arc, 0, 1000);
+    lv_arc_set_value(arc, 0);
+    lv_obj_remove_style(arc, NULL, LV_PART_KNOB);
+    lv_obj_clear_flag(arc, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_set_style_bg_opa(arc, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(arc, 0, 0);
+    lv_obj_set_style_arc_width(arc, track_w, LV_PART_MAIN);
+    lv_obj_set_style_arc_color(arc, COL_BAR_BG, LV_PART_MAIN);
+    lv_obj_set_style_arc_width(arc, track_w, LV_PART_INDICATOR);
+    lv_obj_set_style_arc_color(arc, indic_color, LV_PART_INDICATOR);
+    return arc;
+}
+
+static void init_countdown_screen(lv_obj_t* scr) {
+    countdown_container = lv_obj_create(scr);
+    lv_obj_set_size(countdown_container, SCR_W, SCR_H);
+    lv_obj_set_pos(countdown_container, 0, 0);
+    lv_obj_set_style_bg_opa(countdown_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(countdown_container, 0, 0);
+    lv_obj_set_style_pad_all(countdown_container, 0, 0);
+    lv_obj_clear_flag(countdown_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(countdown_container, global_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lv_obj_t* title = lv_label_create(countdown_container);
+    lv_label_set_text(title, "Session");
+    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+
+    // Concentric rings: outer = weekly consumption (fills as quota is used),
+    // inner = session reset progress (depletes as the reset approaches).
+    countdown_week_arc = make_ring(countdown_container, 376, 14, COL_GREEN, 44);
+    countdown_arc      = make_ring(countdown_container, 326, 14, COL_ACCENT, 44);
+
+    lbl_countdown_caption = lv_label_create(countdown_container);
+    lv_label_set_text(lbl_countdown_caption, "RESETS IN");
+    lv_obj_set_style_text_font(lbl_countdown_caption, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_countdown_caption, COL_DIM, 0);
+    lv_obj_align(lbl_countdown_caption, LV_ALIGN_CENTER, 0, -18);
+
+    lbl_countdown_big = lv_label_create(countdown_container);
+    lv_label_set_text(lbl_countdown_big, "-:--:--");
+    lv_obj_set_style_text_font(lbl_countdown_big, &font_mono_64, 0);
+    lv_obj_set_style_text_color(lbl_countdown_big, COL_TEXT, 0);
+    lv_obj_align(lbl_countdown_big, LV_ALIGN_CENTER, 0, 44);
+
+    // Ring legends — colour-matched to their ring.
+    lbl_countdown_pct = lv_label_create(countdown_container);
+    lv_label_set_text(lbl_countdown_pct, "Session --%");
+    lv_obj_set_style_text_font(lbl_countdown_pct, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_countdown_pct, COL_ACCENT, 0);
+    lv_obj_align(lbl_countdown_pct, LV_ALIGN_CENTER, 0, 90);
+
+    lbl_countdown_week = lv_label_create(countdown_container);
+    lv_label_set_text(lbl_countdown_week, "Week --%");
+    lv_obj_set_style_text_font(lbl_countdown_week, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_countdown_week, COL_GREEN, 0);
+    lv_obj_align(lbl_countdown_week, LV_ALIGN_CENTER, 0, 116);
+
+    lv_obj_add_flag(countdown_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 // ======== Public API ========
@@ -384,7 +424,8 @@ void ui_init(void) {
     init_battery_icons();
 
     init_usage_screen(scr);
-    init_bluetooth_screen(scr);
+    init_countdown_screen(scr);
+    init_clock_screen(scr);
     splash_init(scr);
 
     // Splash is touch-toggled — tap anywhere on the splash dismisses it
@@ -424,6 +465,32 @@ void ui_update(const UsageData* data) {
 
     format_reset_time(data->weekly_reset_mins, buf, sizeof(buf));
     lv_label_set_text(lbl_weekly_reset, buf);
+
+    // Countdown screen — anchor the session reset target for live ticking.
+    if (data->session_reset_mins >= 0) {
+        countdown_target_ms = lv_tick_get() + (uint32_t)data->session_reset_mins * 60000UL;
+        countdown_valid = true;
+    } else {
+        countdown_valid = false;
+    }
+    countdown_last_shown = -99999;  // force the next tick to re-render
+
+    lv_label_set_text_fmt(lbl_countdown_pct, "Session %d%%", s_pct);
+    lv_label_set_text_fmt(lbl_countdown_week, "Week %d%%", w_pct);
+    int week_v = w_pct * 10;
+    if (week_v > 1000) week_v = 1000;
+    lv_arc_set_value(countdown_week_arc, week_v);
+
+    // Clock screen — anchor the host time for local ticking.
+    if (data->time_of_day >= 0) {
+        clock_base_secs = data->time_of_day;
+        clock_base_ms = lv_tick_get();
+        clock_valid = true;
+    } else {
+        clock_valid = false;
+    }
+    clock_last_shown = -1;
+    if (data->date_str[0]) lv_label_set_text(lbl_clock_date, data->date_str);
 }
 
 void ui_tick_anim(void) {
@@ -450,6 +517,57 @@ void ui_tick_anim(void) {
     }
 }
 
+void ui_tick_countdown(void) {
+    if (current_screen != SCREEN_COUNTDOWN) return;
+
+    int remaining_sec;
+    if (!countdown_valid) {
+        remaining_sec = -1;
+    } else {
+        int32_t diff = (int32_t)(countdown_target_ms - lv_tick_get());
+        remaining_sec = (diff > 0) ? (diff / 1000) : 0;
+    }
+
+    if (remaining_sec == countdown_last_shown) return;
+    countdown_last_shown = remaining_sec;
+
+    if (remaining_sec < 0) {
+        lv_label_set_text(lbl_countdown_big, "-:--:--");
+        lv_arc_set_value(countdown_arc, 0);
+        return;
+    }
+
+    int h = remaining_sec / 3600;
+    int m = (remaining_sec % 3600) / 60;
+    int s = remaining_sec % 60;
+    lv_label_set_text_fmt(lbl_countdown_big, "%d:%02d:%02d", h, m, s);
+
+    int total = SESSION_WINDOW_MIN * 60;
+    int v = (int)((int64_t)remaining_sec * 1000 / total);
+    if (v > 1000) v = 1000;
+    lv_arc_set_value(countdown_arc, v);
+}
+
+void ui_tick_clock(void) {
+    if (current_screen != SCREEN_CLOCK) return;
+
+    if (!clock_valid) {
+        if (clock_last_shown == -2) return;
+        clock_last_shown = -2;
+        lv_label_set_text(lbl_clock_time, "--:--");
+        lv_label_set_text(lbl_clock_secs, "--");
+        return;
+    }
+
+    uint32_t elapsed = (lv_tick_get() - clock_base_ms) / 1000;
+    int cur = (clock_base_secs + (int)elapsed) % 86400;
+    if (cur == clock_last_shown) return;
+    clock_last_shown = cur;
+
+    lv_label_set_text_fmt(lbl_clock_time, "%02d:%02d", cur / 3600, (cur % 3600) / 60);
+    lv_label_set_text_fmt(lbl_clock_secs, "%02d", cur % 60);
+}
+
 static screen_t prev_non_splash_screen = SCREEN_USAGE;
 // Hide the battery indicator on the splash screen — the icon is visually
 // noisy over the pixel-art creature animations.
@@ -459,30 +577,30 @@ static void apply_battery_visibility(void) {
     else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
 }
 
-// LVGL handles click debouncing internally. Screen-level handler fires when
-// no child consumed the event (children only consume if they have their own
-// event callback, e.g. the Reset Bluetooth zone). On BT screen we skip the
-// splash toggle so only the reset zone is interactive there.
+// LVGL handles click debouncing internally. A tap anywhere on any
+// non-splash screen toggles the splash on/off.
 static void global_click_cb(lv_event_t* e) {
     (void)e;
-    if (ui_get_current_screen() == SCREEN_BLUETOOTH) return;
     ui_toggle_splash();
-}
-
-static void ble_reset_click_cb(lv_event_t* e) {
-    (void)e;
-    ble_clear_bonds();
 }
 
 void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(usage_container, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_add_flag(ble_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(countdown_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(clock_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
     case SCREEN_SPLASH:     splash_show(); break;
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
-    case SCREEN_BLUETOOTH:  lv_obj_clear_flag(ble_container, LV_OBJ_FLAG_HIDDEN); break;
+    case SCREEN_COUNTDOWN:
+        lv_obj_clear_flag(countdown_container, LV_OBJ_FLAG_HIDDEN);
+        countdown_last_shown = -99999;  // force a re-render on the first tick
+        break;
+    case SCREEN_CLOCK:
+        lv_obj_clear_flag(clock_container, LV_OBJ_FLAG_HIDDEN);
+        clock_last_shown = -1;  // force a re-render on the first tick
+        break;
     default: break;
     }
 
@@ -498,7 +616,12 @@ void ui_show_screen(screen_t screen) {
 }
 
 void ui_cycle_screen(void) {
-    screen_t next = (current_screen == SCREEN_USAGE) ? SCREEN_BLUETOOTH : SCREEN_USAGE;
+    screen_t next;
+    switch (current_screen) {
+    case SCREEN_USAGE:     next = SCREEN_COUNTDOWN; break;
+    case SCREEN_COUNTDOWN: next = SCREEN_CLOCK; break;
+    default:               next = SCREEN_USAGE; break;
+    }
     ui_show_screen(next);
 }
 
@@ -509,38 +632,6 @@ void ui_toggle_splash(void) {
 
 screen_t ui_get_current_screen(void) {
     return current_screen;
-}
-
-void ui_update_ble_status(ble_state_t state, const char* name, const char* mac) {
-    switch (state) {
-    case BLE_STATE_CONNECTED:
-        lv_label_set_text(lbl_ble_status, "Connected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_GREEN, 0);
-        break;
-    case BLE_STATE_ADVERTISING:
-        lv_label_set_text(lbl_ble_status, "Advertising...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_AMBER, 0);
-        break;
-    case BLE_STATE_DISCONNECTED:
-        lv_label_set_text(lbl_ble_status, "Disconnected");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_RED, 0);
-        break;
-    default:
-        lv_label_set_text(lbl_ble_status, "Initializing...");
-        lv_obj_set_style_text_color(lbl_ble_status, COL_DIM, 0);
-        break;
-    }
-
-    if (name) {
-        static char nbuf[48];
-        snprintf(nbuf, sizeof(nbuf), "Device: %s", name);
-        lv_label_set_text(lbl_ble_device, nbuf);
-    }
-    if (mac) {
-        static char mbuf[48];
-        snprintf(mbuf, sizeof(mbuf), "Address: %s", mac);
-        lv_label_set_text(lbl_ble_mac, mbuf);
-    }
 }
 
 void ui_update_battery(int percent, bool charging) {

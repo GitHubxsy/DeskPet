@@ -1,10 +1,10 @@
 #!/bin/bash
 # Claude Usage Tracker Daemon (BLE)
 # Reads Claude Code OAuth token, polls usage via API, sends to ESP32 over BLE GATT.
-# Auto-connects and reconnects to the Claude Controller BLE device.
+# Auto-connects and reconnects to the Clawdmeter BLE device.
 # Dependencies: curl, awk, bluetoothctl
 
-DEVICE_NAME="Claude Controller"
+DEVICE_NAME="Clawdmeter"
 DEVICE_MAC="${DEVICE_MAC:-}"  # auto-discovered if empty
 SERVICE_UUID="4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID="4c41555a-4465-7669-6365-000000000002"
@@ -60,7 +60,7 @@ save_mac() {
     echo "$DEVICE_MAC" > "$SAVED_MAC_FILE"
 }
 
-# Scan for Claude Controller
+# Scan for Clawdmeter
 scan_for_device() {
     log "Scanning for '$DEVICE_NAME'..."
     # Start LE scan
@@ -221,14 +221,18 @@ poll() {
     s7d_reset=${s7d_reset:-0}
     status=${status:-unknown}
 
+    local tod datestr
+    tod=$(( 10#$(date +%H) * 3600 + 10#$(date +%M) * 60 + 10#$(date +%S) ))
+    datestr=$(date "+%a, %d %b %Y")
+
     local payload
-    payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$status" -v now="$now" \
+    payload=$(awk -v u5="$s5h_util" -v r5="$s5h_reset" -v u7="$s7d_util" -v r7="$s7d_reset" -v st="$status" -v now="$now" -v tod="$tod" -v ds="$datestr" \
         'BEGIN {
             sp = sprintf("%.0f", u5 * 100);
             sr = (r5 - now) / 60; sr = sr > 0 ? sprintf("%.0f", sr) : 0;
             wp = sprintf("%.0f", u7 * 100);
             wr = (r7 - now) / 60; wr = wr > 0 ? sprintf("%.0f", wr) : 0;
-            printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"ok\":true}", sp, sr, wp, wr, st;
+            printf "{\"s\":%s,\"sr\":%s,\"w\":%s,\"wr\":%s,\"st\":\"%s\",\"t\":%s,\"d\":\"%s\",\"ok\":true}", sp, sr, wp, wr, st, tod, ds;
         }')
 
     log "Sending: $payload"

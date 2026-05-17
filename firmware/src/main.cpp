@@ -168,6 +168,8 @@ static bool parse_json(const char* json, UsageData* out) {
     out->weekly_pct = doc["w"] | 0.0f;
     out->weekly_reset_mins = doc["wr"] | -1;
     strlcpy(out->status, doc["st"] | "unknown", sizeof(out->status));
+    out->time_of_day = doc["t"] | -1;
+    strlcpy(out->date_str, doc["d"] | "", sizeof(out->date_str));
     out->ok = doc["ok"] | false;
     out->valid = true;
     return true;
@@ -288,9 +290,6 @@ void setup() {
     // Build dashboard
     ui_init();
 
-    // Show initial BLE status on Bluetooth screen
-    ui_update_ble_status(ble_get_state(), ble_get_device_name(), ble_get_mac_address());
-
     // Show initial battery status
     ui_update_battery(power_battery_pct(), power_is_charging());
 
@@ -298,8 +297,6 @@ void setup() {
 
     Serial.println("Dashboard ready, waiting for data on BLE...");
 }
-
-static ble_state_t last_ble_state = BLE_STATE_INIT;
 
 // Brightness ramp state for rotation transition
 // On rotation change we blank the panel, force a full LVGL redraw at the
@@ -334,6 +331,8 @@ void loop() {
     touch_read();
     lv_timer_handler();
     ui_tick_anim();
+    ui_tick_countdown();
+    ui_tick_clock();
     ble_tick();
     power_tick();
     imu_tick();
@@ -366,13 +365,6 @@ void loop() {
     }
 
     handle_rotation_change();
-
-    // Update BLE status on screen when state changes
-    ble_state_t bs = ble_get_state();
-    if (bs != last_ble_state) {
-        last_ble_state = bs;
-        ui_update_ble_status(bs, ble_get_device_name(), ble_get_mac_address());
-    }
 
     // Update battery indicator
     static int last_pct = -2;

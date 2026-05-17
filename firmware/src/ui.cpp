@@ -57,9 +57,6 @@ static lv_obj_t* lbl_countdown_big;
 static lv_obj_t* lbl_countdown_pct;    // session utilization legend
 static lv_obj_t* lbl_countdown_week;   // weekly utilization legend
 
-// Session rate-limit window length — denominator for the progress ring.
-#define SESSION_WINDOW_MIN  300   // 5-hour unified window
-
 // Countdown state. countdown_target_ms is the lv_tick value at which the
 // session resets; the screen decrements locally each second between polls.
 static uint32_t countdown_target_ms = 0;
@@ -477,6 +474,9 @@ void ui_update(const UsageData* data) {
 
     lv_label_set_text_fmt(lbl_countdown_pct, "Session %d%%", s_pct);
     lv_label_set_text_fmt(lbl_countdown_week, "Week %d%%", w_pct);
+    int sess_v = s_pct * 10;
+    if (sess_v > 1000) sess_v = 1000;
+    lv_arc_set_value(countdown_arc, sess_v);
     int week_v = w_pct * 10;
     if (week_v > 1000) week_v = 1000;
     lv_arc_set_value(countdown_week_arc, week_v);
@@ -533,7 +533,6 @@ void ui_tick_countdown(void) {
 
     if (remaining_sec < 0) {
         lv_label_set_text(lbl_countdown_big, "-:--:--");
-        lv_arc_set_value(countdown_arc, 0);
         return;
     }
 
@@ -541,11 +540,6 @@ void ui_tick_countdown(void) {
     int m = (remaining_sec % 3600) / 60;
     int s = remaining_sec % 60;
     lv_label_set_text_fmt(lbl_countdown_big, "%d:%02d:%02d", h, m, s);
-
-    int total = SESSION_WINDOW_MIN * 60;
-    int v = (int)((int64_t)remaining_sec * 1000 / total);
-    if (v > 1000) v = 1000;
-    lv_arc_set_value(countdown_arc, v);
 }
 
 void ui_tick_clock(void) {

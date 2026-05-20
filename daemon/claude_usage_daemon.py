@@ -21,6 +21,11 @@ import httpx
 from bleak import BleakClient, BleakScanner
 from bleak.exc import BleakError
 
+try:
+    import deepseek_chat
+except ImportError:
+    deepseek_chat = None
+
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
@@ -48,6 +53,20 @@ API_BODY = {
     "max_tokens": 1,
     "messages": [{"role": "user", "content": "hi"}],
 }
+
+# AI chat — preset questions. Must stay in sync with chat_questions[] in
+# the firmware (ui.cpp): the device sends an index, this maps it to text.
+CHAT_QUESTIONS = [
+    "Give me a Claude Code tip",
+    "Tell me a short joke",
+    "Explain recursion simply",
+    "What can you do?",
+]
+CHAT_SYSTEM = (
+    "You are CodePet, a tiny desk companion shown on a 480x480 screen. "
+    "Answer in English using plain ASCII only, at most 3 short sentences. "
+    "Be friendly and concise."
+)
 
 
 def log(msg: str) -> None:
@@ -200,30 +219,106 @@ async def poll_api(token: str) -> dict | None:
     return payload
 
 
+def _ascii_clean(text: str) -> str:
+    """Make text safe for the device's ASCII-only fonts and byte-chunking."""
+    repl = {
+        "‘": "'", "’": "'", "“": '"', "”": '"',
+        "–": "-", "—": "-", "…": "...", "•": "*",
+    }
+    for k, v in repl.items():
+        text = text.replace(k, v)
+    return text.encode("ascii", "ignore").decode("ascii")
+
+
 class Session:
     def __init__(self, client: BleakClient) -> None:
         self.client = client
         self.refresh_requested = asyncio.Event()
+        self.write_lock = asyncio.Lock()
+        self.chat_busy = False
+        self._chat_task: asyncio.Task | None = None
 
-    def _on_refresh(self, _char, _data: bytearray) -> None:
-        log("Refresh requested by device")
-        self.refresh_requested.set()
+    def _on_req(self, _char, data: bytearray) -> None:
+        """REQ-characteristic notify handler. 0x01 = refresh, 0x10+ = chat, 0x20 = open app."""
+        if not data:
+            return
+        code = data[0]
+        if code == 0x01:
+            log("Refresh requested by device")
+            self.refresh_requested.set()
+        elif 0x10 <= code <= 0x1F:
+            self._chat_task = asyncio.create_task(self.handle_chat(code - 0x10))
+        elif code == 0x20:
+            log("Open Claude app requested by device")
+            try:
+                if sys.platform == "darwin":
+                    subprocess.Popen(["open", "-a", "Claude"])
+                else:
+                    subprocess.Popen(["xdg-open", "https://claude.ai"])
+            except OSError as e:
+                log(f"Failed to open Claude: {e}")
+        else:
+            log(f"Unknown REQ code: {code:#x}")
 
     async def setup_refresh_subscription(self) -> None:
         try:
-            await self.client.start_notify(REQ_CHAR_UUID, self._on_refresh)
+            await self.client.start_notify(REQ_CHAR_UUID, self._on_req)
         except (BleakError, ValueError) as e:
-            log(f"Refresh subscription unavailable: {e}")
+            log(f"REQ subscription unavailable: {e}")
+
+    async def _write(self, data: bytes) -> bool:
+        async with self.write_lock:
+            try:
+                await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
+                return True
+            except BleakError as e:
+                log(f"Write failed: {e}")
+                return False
 
     async def write_payload(self, payload: dict) -> bool:
         data = json.dumps(payload, separators=(",", ":")).encode()
         log(f"Sending: {data.decode()}")
+        return await self._write(data)
+
+    async def handle_chat(self, idx: int) -> None:
+        """Answer a preset question via DeepSeek, streamed back in chunks.
+
+        Chunks are tagged on the RX characteristic: 0x02 = text chunk,
+        0x04 = response complete, 0x15 = error.
+        """
+        if self.chat_busy:
+            log("Chat already in progress; ignoring request")
+            return
+        if not 0 <= idx < len(CHAT_QUESTIONS):
+            log(f"Bad chat index: {idx}")
+            return
+        self.chat_busy = True
+        question = CHAT_QUESTIONS[idx]
+        log(f"Chat request: {question}")
         try:
-            await self.client.write_gatt_char(RX_CHAR_UUID, data, response=False)
-            return True
-        except BleakError as e:
-            log(f"Write failed: {e}")
-            return False
+            if deepseek_chat is None:
+                await self._write(b"\x15AI module unavailable")
+                return
+            messages = [
+                {"role": "system", "content": CHAT_SYSTEM},
+                {"role": "user", "content": question},
+            ]
+            try:
+                answer = await asyncio.to_thread(deepseek_chat.chat, messages)
+            except Exception as e:  # noqa: BLE001
+                log(f"DeepSeek call failed: {e}")
+                msg = f"AI error: {e}"[:200]
+                await self._write(b"\x15" + msg.encode("ascii", "ignore"))
+                return
+            answer = _ascii_clean(answer).strip() or "(no answer)"
+            log(f"Chat answer: {len(answer)} chars")
+            chunk = 160
+            for i in range(0, len(answer), chunk):
+                piece = answer[i:i + chunk].encode("ascii", "ignore")
+                await self._write(b"\x02" + piece)
+            await self._write(b"\x04")
+        finally:
+            self.chat_busy = False
 
 
 async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:

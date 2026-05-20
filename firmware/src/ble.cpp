@@ -12,6 +12,7 @@
 #define REQ_CHAR_UUID       "4c41555a-4465-7669-6365-000000000004"  // device-initiated refresh request
 
 #define BLE_BUF_SIZE 512
+#define CHAT_BUF_SIZE 2048
 
 // HID keyboard report descriptor
 static const uint8_t HID_REPORT_MAP[] = {
@@ -55,6 +56,13 @@ static volatile bool data_ready = false;
 static volatile bool has_received_data = false;
 static char mac_str[18];
 
+// AI chat response buffer — daemon writes chunks tagged on the RX char.
+static char chat_buf[CHAT_BUF_SIZE];
+static volatile size_t chat_len = 0;
+static volatile bool chat_updated = false;
+static volatile bool chat_complete = false;
+static volatile bool chat_error = false;
+
 static void start_advertising() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
     adv->reset();
@@ -88,10 +96,43 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
 };
 
+// The RX characteristic carries two kinds of message, told apart by the
+// first byte: a usage payload is JSON (starts with '{'); chat traffic is
+// tagged 0x02 (text chunk), 0x04 (response complete), 0x15 (error).
 class RxCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
         std::string val = chr->getValue();
         size_t len = val.length();
+        if (len == 0) return;
+        uint8_t tag = (uint8_t)val[0];
+
+        if (tag == 0x02) {  // chat text chunk
+            size_t tlen = len - 1;
+            if (chat_len + tlen >= CHAT_BUF_SIZE) tlen = CHAT_BUF_SIZE - 1 - chat_len;
+            memcpy(chat_buf + chat_len, val.c_str() + 1, tlen);
+            chat_len += tlen;
+            chat_buf[chat_len] = '\0';
+            chat_updated = true;
+            return;
+        }
+        if (tag == 0x04) {  // chat response complete
+            chat_complete = true;
+            chat_updated = true;
+            return;
+        }
+        if (tag == 0x15) {  // chat error — payload is the message
+            size_t tlen = len - 1;
+            if (tlen >= CHAT_BUF_SIZE) tlen = CHAT_BUF_SIZE - 1;
+            memcpy(chat_buf, val.c_str() + 1, tlen);
+            chat_buf[tlen] = '\0';
+            chat_len = tlen;
+            chat_error = true;
+            chat_complete = true;
+            chat_updated = true;
+            return;
+        }
+
+        // Usage JSON payload
         if (len >= BLE_BUF_SIZE) len = BLE_BUF_SIZE - 1;
         memcpy(rx_buf, val.c_str(), len);
         rx_buf[len] = '\0';
@@ -221,6 +262,47 @@ void ble_request_refresh(void) {
         req_char->setValue(&v, 1);
         req_char->notify();
         Serial.println("BLE: refresh requested");
+    }
+}
+
+void ble_send_chat_request(uint8_t question_idx) {
+    chat_len = 0;
+    chat_buf[0] = '\0';
+    chat_updated = false;
+    chat_complete = false;
+    chat_error = false;
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v = 0x10 + question_idx;  // 0x10..0x1F reserved for chat
+        req_char->setValue(&v, 1);
+        req_char->notify();
+        Serial.printf("BLE: chat request %u\n", question_idx);
+    }
+}
+
+bool ble_chat_has_update(void) {
+    if (!chat_updated) return false;
+    chat_updated = false;
+    return true;
+}
+
+const char* ble_chat_text(void) {
+    return chat_buf;
+}
+
+bool ble_chat_is_complete(void) {
+    return chat_complete;
+}
+
+bool ble_chat_has_error(void) {
+    return chat_error;
+}
+
+void ble_send_open_app(void) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v = 0x20;
+        req_char->setValue(&v, 1);
+        req_char->notify();
+        Serial.println("BLE: open app requested");
     }
 }
 

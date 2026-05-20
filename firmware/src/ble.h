@@ -20,6 +20,16 @@ void ble_send_ack(void);
 void ble_send_nack(void);
 void ble_request_refresh(void);
 
+// AI chat — request a preset question by index; response arrives in chunks.
+void ble_send_chat_request(uint8_t question_idx);
+bool ble_chat_has_update(void);   // true once when a new chunk/end/error arrived
+const char* ble_chat_text(void);  // accumulated response text so far
+bool ble_chat_is_complete(void);
+bool ble_chat_has_error(void);
+
+// Request the host to open the Claude app
+void ble_send_open_app(void);
+
 // BLE HID keyboard
 void ble_keyboard_press(uint8_t key, uint8_t modifier);
 void ble_keyboard_release(void);

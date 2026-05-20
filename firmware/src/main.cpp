@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <math.h>
 #include <lvgl.h>
 #include <ArduinoJson.h>
 #include "display_cfg.h"
@@ -333,6 +334,7 @@ void loop() {
     ui_tick_anim();
     ui_tick_countdown();
     ui_tick_clock();
+    ui_tick_chat();
     ble_tick();
     power_tick();
     imu_tick();
@@ -395,6 +397,27 @@ void loop() {
             ble_send_ack();
         } else {
             ble_send_nack();
+        }
+    }
+
+    // Idle nudge — if session_pct hasn't changed for 5 min, suggest opening Claude
+    {
+        static float    idle_last_pct = -1.0f;
+        static uint32_t idle_change_ms = 0;
+        static bool     nudge_dismissed = false;
+
+        if (usage.valid && ble_get_state() == BLE_STATE_CONNECTED) {
+            float cur = usage.session_pct;
+            if (fabsf(cur - idle_last_pct) > 0.01f) {
+                idle_last_pct = cur;
+                idle_change_ms = millis();
+                nudge_dismissed = false;
+                if (ui_nudge_is_visible()) ui_hide_nudge();
+            } else if (!nudge_dismissed && !ui_nudge_is_visible() &&
+                       millis() - idle_change_ms > 300000UL) {
+                ui_show_nudge();
+                nudge_dismissed = true;
+            }
         }
     }
 

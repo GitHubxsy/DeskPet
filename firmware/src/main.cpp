@@ -335,6 +335,7 @@ void loop() {
     ui_tick_countdown();
     ui_tick_clock();
     ui_tick_chat();
+    ui_tick_nudge();
     ble_tick();
     power_tick();
     imu_tick();
@@ -400,7 +401,7 @@ void loop() {
         }
     }
 
-    // Idle nudge — if session_pct hasn't changed for 5 min, suggest opening Claude
+    // Idle nudge — if session_pct hasn't changed, suggest opening Claude
     {
         static float    idle_last_pct = -1.0f;
         static uint32_t idle_change_ms = 0;
@@ -413,8 +414,11 @@ void loop() {
                 idle_change_ms = millis();
                 nudge_dismissed = false;
                 if (ui_nudge_is_visible()) ui_hide_nudge();
+            } else if (nudge_dismissed && !ui_nudge_is_visible()) {
+                idle_change_ms = millis();
+                nudge_dismissed = false;
             } else if (!nudge_dismissed && !ui_nudge_is_visible() &&
-                       millis() - idle_change_ms > 300000UL) {
+                       millis() - idle_change_ms > 5000UL) {  // DEMO: 5s instead of 5min
                 ui_show_nudge();
                 nudge_dismissed = true;
             }

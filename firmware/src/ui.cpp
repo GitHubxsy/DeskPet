@@ -2,6 +2,7 @@
 #include "splash.h"
 #include "ble.h"
 #include <lvgl.h>
+#include <esp_heap_caps.h>
 #include "logo.h"
 #include "icons.h"
 #include "display_cfg.h"
@@ -97,8 +98,55 @@ static const char* const chat_questions[] = {
 };
 #define CHAT_QUESTION_COUNT 4
 
-// ---- Nudge overlay (idle reminder, on top of everything) ----
+// ---- Nudge overlay (idle reminder — finger + Claude animation, on top of everything) ----
 static lv_obj_t* nudge_overlay = nullptr;
+static lv_obj_t* nudge_anim_canvas = nullptr;
+static lv_obj_t* nudge_finger_canvas = nullptr;
+static uint16_t* nudge_anim_buf = nullptr;
+static uint16_t* nudge_finger_buf = nullptr;
+static int       nudge_anim_idx = -1;
+static int       nudge_frame = 0;
+static uint32_t  nudge_frame_ms = 0;
+static uint16_t  nudge_cur_hold = 200;
+
+#define NUDGE_CELL   12
+#define NUDGE_ANIM_W (20 * NUDGE_CELL)  // 240
+#define NUDGE_ANIM_H (20 * NUDGE_CELL)  // 240
+
+// Classic cursor hand rotated 90° CW — pointing RIGHT toward the Claude animation
+#define FINGER_GW    16
+#define FINGER_GH    11
+#define FINGER_CELL  10
+#define FINGER_PX_W  (FINGER_GW * FINGER_CELL)  // 160
+#define FINGER_PX_H  (FINGER_GH * FINGER_CELL)  // 110
+
+static const uint16_t finger_palette[] = {
+    0x0000,  // 0 = bg (black)
+    0x7BEF,  // 1 = outline (gray)
+    0xFFFF,  // 2 = fill (white)
+};
+static const uint8_t finger_grid[FINGER_GH * FINGER_GW] = {
+    0,0,0,0,0,0,0,1,1,0,0,0,0,0,0,0,
+    0,0,0,0,0,0,1,2,2,1,0,0,0,0,0,0,
+    0,0,0,0,1,1,2,2,1,0,0,0,0,0,0,0,
+    0,1,1,1,2,2,2,1,1,1,1,1,1,1,1,0,
+    1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,
+    1,2,2,2,2,2,2,2,2,2,2,2,2,2,2,1,
+    1,2,2,2,2,2,2,2,1,1,1,1,1,1,1,0,
+    1,2,2,2,2,2,2,2,2,2,2,1,0,0,0,0,
+    1,2,2,2,2,2,2,2,1,1,1,0,0,0,0,0,
+    0,1,1,1,1,2,2,2,2,1,0,0,0,0,0,0,
+    0,0,0,0,0,1,1,1,1,0,0,0,0,0,0,0,
+};
+
+// Cursor hand + animation horizontal layout (centered in 480px)
+#define NUDGE_GAP     16
+#define NUDGE_TOTAL_W (FINGER_PX_W + NUDGE_GAP + NUDGE_ANIM_W)  // 416
+#define NUDGE_LEFT    ((SCR_W - NUDGE_TOTAL_W) / 2)              // 32
+#define NUDGE_FINGER_X NUDGE_LEFT
+#define NUDGE_ANIM_X  (NUDGE_LEFT + FINGER_PX_W + NUDGE_GAP)    // 208
+#define NUDGE_ANIM_Y  ((SCR_H - NUDGE_ANIM_H) / 2)              // 120
+#define NUDGE_FINGER_Y ((SCR_H - FINGER_PX_H) / 2)              // 185
 
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
@@ -552,7 +600,19 @@ void ui_tick_chat(void) {
     }
 }
 
-// ======== Nudge overlay (idle reminder) ========
+// ======== Nudge overlay (finger → Claude animation, tap to open) ========
+
+static void render_finger(uint16_t* buf) {
+    for (int gy = 0; gy < FINGER_GH; gy++) {
+        uint16_t* first = &buf[gy * FINGER_CELL * FINGER_PX_W];
+        for (int gx = 0; gx < FINGER_GW; gx++) {
+            uint16_t c = finger_palette[finger_grid[gy * FINGER_GW + gx]];
+            for (int dx = 0; dx < FINGER_CELL; dx++) first[gx * FINGER_CELL + dx] = c;
+        }
+        for (int dy = 1; dy < FINGER_CELL; dy++)
+            memcpy(first + dy * FINGER_PX_W, first, FINGER_PX_W * 2);
+    }
+}
 
 static void nudge_click_cb(lv_event_t* e) {
     (void)e;
@@ -561,6 +621,15 @@ static void nudge_click_cb(lv_event_t* e) {
 }
 
 static void init_nudge_overlay(lv_obj_t* scr) {
+    nudge_anim_idx = splash_find_anim("work coding");
+
+    nudge_anim_buf = (uint16_t*)heap_caps_malloc(NUDGE_ANIM_W * NUDGE_ANIM_H * 2, MALLOC_CAP_SPIRAM);
+    nudge_finger_buf = (uint16_t*)heap_caps_malloc(FINGER_PX_W * FINGER_PX_H * 2, MALLOC_CAP_SPIRAM);
+    if (!nudge_anim_buf || !nudge_finger_buf) {
+        Serial.println("nudge: PSRAM alloc failed");
+        return;
+    }
+
     nudge_overlay = lv_obj_create(scr);
     lv_obj_set_size(nudge_overlay, SCR_W, SCR_H);
     lv_obj_set_pos(nudge_overlay, 0, 0);
@@ -570,28 +639,36 @@ static void init_nudge_overlay(lv_obj_t* scr) {
     lv_obj_clear_flag(nudge_overlay, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(nudge_overlay, nudge_click_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* sub = lv_label_create(nudge_overlay);
-    lv_label_set_text(sub, "No activity detected");
-    lv_obj_set_style_text_font(sub, &font_styrene_24, 0);
-    lv_obj_set_style_text_color(sub, COL_DIM, 0);
-    lv_obj_align(sub, LV_ALIGN_CENTER, 0, -48);
+    // Finger canvas (static, rendered once)
+    render_finger(nudge_finger_buf);
+    nudge_finger_canvas = lv_canvas_create(nudge_overlay);
+    lv_canvas_set_buffer(nudge_finger_canvas, nudge_finger_buf,
+                         FINGER_PX_W, FINGER_PX_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_pos(nudge_finger_canvas, NUDGE_FINGER_X, NUDGE_FINGER_Y);
 
-    lv_obj_t* main_lbl = lv_label_create(nudge_overlay);
-    lv_label_set_text(main_lbl, "Go back to Claude");
-    lv_obj_set_style_text_font(main_lbl, &font_styrene_48, 0);
-    lv_obj_set_style_text_color(main_lbl, COL_ACCENT, 0);
-    lv_obj_set_width(main_lbl, CONTENT_W);
-    lv_obj_set_style_text_align(main_lbl, LV_TEXT_ALIGN_CENTER, 0);
-    lv_label_set_long_mode(main_lbl, LV_LABEL_LONG_WRAP);
-    lv_obj_align(main_lbl, LV_ALIGN_CENTER, 0, 10);
-
-    lv_obj_t* hint = lv_label_create(nudge_overlay);
-    lv_label_set_text(hint, "Tap to open");
-    lv_obj_set_style_text_font(hint, &font_styrene_20, 0);
-    lv_obj_set_style_text_color(hint, COL_DIM, 0);
-    lv_obj_align(hint, LV_ALIGN_CENTER, 0, 60);
+    // Claude animation canvas
+    nudge_anim_canvas = lv_canvas_create(nudge_overlay);
+    lv_canvas_set_buffer(nudge_anim_canvas, nudge_anim_buf,
+                         NUDGE_ANIM_W, NUDGE_ANIM_H, LV_COLOR_FORMAT_RGB565);
+    lv_obj_set_pos(nudge_anim_canvas, NUDGE_ANIM_X, NUDGE_ANIM_Y);
 
     lv_obj_add_flag(nudge_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+void ui_tick_nudge(void) {
+    if (!nudge_overlay || lv_obj_has_flag(nudge_overlay, LV_OBJ_FLAG_HIDDEN)) return;
+    if (nudge_anim_idx < 0 || !nudge_anim_buf) return;
+
+    int nframes = splash_anim_frames(nudge_anim_idx);
+    if (nframes == 0) return;
+
+    if (millis() - nudge_frame_ms >= nudge_cur_hold) {
+        nudge_frame = (nudge_frame + 1) % nframes;
+        splash_render_scaled(nudge_anim_idx, nudge_frame, nudge_anim_buf, NUDGE_CELL);
+        nudge_cur_hold = splash_frame_hold(nudge_anim_idx, nudge_frame);
+        nudge_frame_ms = millis();
+        lv_obj_invalidate(nudge_anim_canvas);
+    }
 }
 
 // ======== Public API ========
@@ -847,14 +924,42 @@ void ui_update_battery(int percent, bool charging) {
     apply_battery_visibility();
 }
 
+static void finger_anim_xcb(void* var, int32_t val) {
+    lv_obj_set_x((lv_obj_t*)var, val);
+}
+
 void ui_show_nudge(void) {
     if (!nudge_overlay) return;
     lv_obj_clear_flag(nudge_overlay, LV_OBJ_FLAG_HIDDEN);
+
+    // Render first frame
+    nudge_frame = 0;
+    nudge_frame_ms = millis();
+    if (nudge_anim_idx >= 0 && nudge_anim_buf) {
+        splash_render_scaled(nudge_anim_idx, 0, nudge_anim_buf, NUDGE_CELL);
+        nudge_cur_hold = splash_frame_hold(nudge_anim_idx, 0);
+        lv_obj_invalidate(nudge_anim_canvas);
+    }
+
+    // Start finger oscillation
+    if (nudge_finger_canvas) {
+        lv_anim_t a;
+        lv_anim_init(&a);
+        lv_anim_set_var(&a, nudge_finger_canvas);
+        lv_anim_set_values(&a, NUDGE_FINGER_X - 10, NUDGE_FINGER_X + 10);
+        lv_anim_set_duration(&a, 700);
+        lv_anim_set_playback_duration(&a, 700);
+        lv_anim_set_repeat_count(&a, LV_ANIM_REPEAT_INFINITE);
+        lv_anim_set_exec_cb(&a, finger_anim_xcb);
+        lv_anim_start(&a);
+    }
 }
 
 void ui_hide_nudge(void) {
     if (!nudge_overlay) return;
     lv_obj_add_flag(nudge_overlay, LV_OBJ_FLAG_HIDDEN);
+    if (nudge_finger_canvas)
+        lv_anim_delete(nudge_finger_canvas, finger_anim_xcb);
 }
 
 bool ui_nudge_is_visible(void) {

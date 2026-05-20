@@ -22,6 +22,7 @@ void ui_toggle_splash(void);
 screen_t ui_get_current_screen(void);
 void ui_update_battery(int percent, bool charging);
 
+void ui_tick_nudge(void);
 void ui_show_nudge(void);
 void ui_hide_nudge(void);
 bool ui_nudge_is_visible(void);

@@ -26,3 +26,10 @@ bool splash_is_active(void);
 
 // Root container (so ui.cpp can attach a click event).
 lv_obj_t* splash_get_root(void);
+
+// Look up an animation by name. Returns index or -1.
+int splash_find_anim(const char* name);
+int splash_anim_frames(int anim_idx);
+uint16_t splash_frame_hold(int anim_idx, int frame_idx);
+// Render a frame into an external buffer at an arbitrary cell size.
+void splash_render_scaled(int anim_idx, int frame_idx, uint16_t* buf, int cell_size);

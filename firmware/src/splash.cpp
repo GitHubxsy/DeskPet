@@ -201,3 +201,40 @@ void splash_hide(void) {
 lv_obj_t* splash_get_root(void) {
     return splash_container;
 }
+
+int splash_find_anim(const char* name) {
+    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
+        if (strcmp(splash_anims[i].name, name) == 0) return i;
+    }
+    return -1;
+}
+
+int splash_anim_frames(int anim_idx) {
+    if (anim_idx < 0 || anim_idx >= SPLASH_ANIM_COUNT) return 0;
+    return splash_anims[anim_idx].frame_count;
+}
+
+uint16_t splash_frame_hold(int anim_idx, int frame_idx) {
+    if (anim_idx < 0 || anim_idx >= SPLASH_ANIM_COUNT) return 0;
+    const splash_anim_def_t* a = &splash_anims[anim_idx];
+    if (frame_idx < 0 || frame_idx >= a->frame_count) return 0;
+    return a->holds[frame_idx];
+}
+
+void splash_render_scaled(int anim_idx, int frame_idx, uint16_t* buf, int cell_size) {
+    if (anim_idx < 0 || anim_idx >= SPLASH_ANIM_COUNT) return;
+    const splash_anim_def_t* a = &splash_anims[anim_idx];
+    if (frame_idx < 0 || frame_idx >= a->frame_count) return;
+    const uint8_t* cells = a->frames[frame_idx];
+    const uint16_t* pal = a->palette;
+    int w = GRID * cell_size;
+    for (int gy = 0; gy < GRID; gy++) {
+        uint16_t* first = &buf[gy * cell_size * w];
+        for (int gx = 0; gx < GRID; gx++) {
+            uint8_t code = cells[gy * GRID + gx];
+            uint16_t color = (pal && code < SPLASH_PALETTE_SIZE) ? pal[code] : 0x0000;
+            for (int dx = 0; dx < cell_size; dx++) first[gx * cell_size + dx] = color;
+        }
+        for (int dy = 1; dy < cell_size; dy++) memcpy(first + dy * w, first, w * 2);
+    }
+}

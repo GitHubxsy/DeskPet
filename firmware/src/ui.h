@@ -7,6 +7,7 @@ enum screen_t {
     SCREEN_COUNTDOWN,
     SCREEN_CLOCK,
     SCREEN_CHAT,
+    SCREEN_POMODORO,
     SCREEN_COUNT,
 };
 
@@ -26,3 +27,9 @@ void ui_tick_nudge(void);
 void ui_show_nudge(void);
 void ui_hide_nudge(void);
 bool ui_nudge_is_visible(void);
+
+void ui_tick_pomodoro(void);
+void ui_pomodoro_start(void);
+void ui_pomodoro_stop(void);
+bool ui_pomodoro_is_active(void);
+bool ui_pomodoro_is_focus(void);

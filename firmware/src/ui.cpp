@@ -148,6 +148,24 @@ static const uint8_t finger_grid[FINGER_GH * FINGER_GW] = {
 #define NUDGE_ANIM_Y  ((SCR_H - NUDGE_ANIM_H) / 2)              // 120
 #define NUDGE_FINGER_Y ((SCR_H - FINGER_PX_H) / 2)              // 185
 
+// ---- Pomodoro screen widgets ----
+static lv_obj_t* pomo_container = nullptr;
+static lv_obj_t* pomo_arc = nullptr;
+static lv_obj_t* lbl_pomo_title = nullptr;
+static lv_obj_t* lbl_pomo_caption = nullptr;
+static lv_obj_t* lbl_pomo_big = nullptr;
+static lv_obj_t* lbl_pomo_status = nullptr;
+
+enum pomo_phase_t { POMO_IDLE, POMO_FOCUS, POMO_CELEBRATE, POMO_BREAK };
+static pomo_phase_t pomo_phase = POMO_IDLE;
+static uint32_t pomo_end_ms = 0;
+static uint32_t pomo_duration_ms = 0;
+static int      pomo_last_shown = -1;
+
+#define POMO_FOCUS_MS     (10 * 1000UL)   // DEMO: 10s instead of 25min
+#define POMO_BREAK_MS     ( 5 * 1000UL)   // DEMO: 5s instead of 5min
+#define POMO_CELEBRATE_MS 5000UL
+
 // ---- Battery indicator (shared, on top) ----
 static lv_obj_t* battery_img;
 static lv_obj_t* logo_img;
@@ -600,6 +618,53 @@ void ui_tick_chat(void) {
     }
 }
 
+// ======== Pomodoro Screen (480x480) ========
+
+static void pomo_click_cb(lv_event_t* e) {
+    (void)e;
+    if (pomo_phase == POMO_IDLE) ui_pomodoro_start();
+    else                         ui_toggle_splash();
+}
+
+static void init_pomodoro_screen(lv_obj_t* scr) {
+    pomo_container = lv_obj_create(scr);
+    lv_obj_set_size(pomo_container, SCR_W, SCR_H);
+    lv_obj_set_pos(pomo_container, 0, 0);
+    lv_obj_set_style_bg_opa(pomo_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(pomo_container, 0, 0);
+    lv_obj_set_style_pad_all(pomo_container, 0, 0);
+    lv_obj_clear_flag(pomo_container, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(pomo_container, pomo_click_cb, LV_EVENT_CLICKED, NULL);
+
+    lbl_pomo_title = lv_label_create(pomo_container);
+    lv_label_set_text(lbl_pomo_title, "Focus");
+    lv_obj_set_style_text_font(lbl_pomo_title, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(lbl_pomo_title, COL_TEXT, 0);
+    lv_obj_align(lbl_pomo_title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+
+    pomo_arc = make_ring(pomo_container, 350, 14, COL_ACCENT, 44);
+
+    lbl_pomo_caption = lv_label_create(pomo_container);
+    lv_label_set_text(lbl_pomo_caption, "TAP TO START");
+    lv_obj_set_style_text_font(lbl_pomo_caption, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_pomo_caption, COL_DIM, 0);
+    lv_obj_align(lbl_pomo_caption, LV_ALIGN_CENTER, 0, -18);
+
+    lbl_pomo_big = lv_label_create(pomo_container);
+    lv_label_set_text(lbl_pomo_big, "25:00");
+    lv_obj_set_style_text_font(lbl_pomo_big, &font_mono_96, 0);
+    lv_obj_set_style_text_color(lbl_pomo_big, COL_TEXT, 0);
+    lv_obj_align(lbl_pomo_big, LV_ALIGN_CENTER, 0, 44);
+
+    lbl_pomo_status = lv_label_create(pomo_container);
+    lv_label_set_text(lbl_pomo_status, "25 min focus · 5 min break");
+    lv_obj_set_style_text_font(lbl_pomo_status, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_pomo_status, COL_DIM, 0);
+    lv_obj_align(lbl_pomo_status, LV_ALIGN_CENTER, 0, 104);
+
+    lv_obj_add_flag(pomo_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ======== Nudge overlay (finger → Claude animation, tap to open) ========
 
 static void render_finger(uint16_t* buf) {
@@ -618,6 +683,7 @@ static void nudge_click_cb(lv_event_t* e) {
     (void)e;
     ble_send_open_app();
     ui_hide_nudge();
+    ui_pomodoro_start();
 }
 
 static void init_nudge_overlay(lv_obj_t* scr) {
@@ -690,6 +756,7 @@ void ui_init(void) {
     init_countdown_screen(scr);
     init_clock_screen(scr);
     init_chat_screen(scr);
+    init_pomodoro_screen(scr);
     splash_init(scr);
 
     // Splash is touch-toggled — tap anywhere on the splash dismisses it
@@ -853,6 +920,7 @@ void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(countdown_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(clock_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(chat_container, LV_OBJ_FLAG_HIDDEN);
+    if (pomo_container) lv_obj_add_flag(pomo_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
@@ -869,6 +937,10 @@ void ui_show_screen(screen_t screen) {
     case SCREEN_CHAT:
         lv_obj_clear_flag(chat_container, LV_OBJ_FLAG_HIDDEN);
         chat_set_state(CHAT_STATE_LIST);
+        break;
+    case SCREEN_POMODORO:
+        lv_obj_clear_flag(pomo_container, LV_OBJ_FLAG_HIDDEN);
+        pomo_last_shown = -1;
         break;
     default: break;
     }
@@ -890,7 +962,8 @@ void ui_cycle_screen(void) {
     case SCREEN_USAGE:     next = SCREEN_COUNTDOWN; break;
     case SCREEN_COUNTDOWN: next = SCREEN_CLOCK; break;
     case SCREEN_CLOCK:     next = SCREEN_CHAT; break;
-    case SCREEN_CHAT:      next = SCREEN_USAGE; break;
+    case SCREEN_CHAT:      next = SCREEN_POMODORO; break;
+    case SCREEN_POMODORO:  next = SCREEN_USAGE; break;
     default:               next = SCREEN_USAGE; break;
     }
     ui_show_screen(next);
@@ -965,4 +1038,101 @@ void ui_hide_nudge(void) {
 bool ui_nudge_is_visible(void) {
     if (!nudge_overlay) return false;
     return !lv_obj_has_flag(nudge_overlay, LV_OBJ_FLAG_HIDDEN);
+}
+
+// ======== Pomodoro public API ========
+
+static void pomo_set_focus_ui(void) {
+    lv_label_set_text(lbl_pomo_title, "Focus");
+    lv_label_set_text(lbl_pomo_caption, "REMAINING");
+    lv_label_set_text(lbl_pomo_status, "stay focused");
+    lv_obj_set_style_arc_color(pomo_arc, COL_ACCENT, LV_PART_INDICATOR);
+    lv_arc_set_value(pomo_arc, 0);
+}
+
+static void pomo_set_break_ui(void) {
+    lv_label_set_text(lbl_pomo_title, "Break");
+    lv_label_set_text(lbl_pomo_caption, "REMAINING");
+    lv_label_set_text(lbl_pomo_status, "take a rest");
+    lv_obj_set_style_arc_color(pomo_arc, COL_GREEN, LV_PART_INDICATOR);
+    lv_arc_set_value(pomo_arc, 0);
+}
+
+static void pomo_set_idle_ui(void) {
+    lv_label_set_text(lbl_pomo_title, "Focus");
+    lv_label_set_text(lbl_pomo_caption, "TAP TO START");
+    lv_label_set_text(lbl_pomo_big, "25:00");
+    lv_label_set_text(lbl_pomo_status, "25 min focus \xC2\xB7 5 min break");
+    lv_obj_set_style_arc_color(pomo_arc, COL_ACCENT, LV_PART_INDICATOR);
+    lv_arc_set_value(pomo_arc, 0);
+}
+
+void ui_pomodoro_start(void) {
+    pomo_phase = POMO_FOCUS;
+    pomo_duration_ms = POMO_FOCUS_MS;
+    pomo_end_ms = millis() + pomo_duration_ms;
+    pomo_last_shown = -1;
+    pomo_set_focus_ui();
+    ui_show_screen(SCREEN_POMODORO);
+}
+
+void ui_pomodoro_stop(void) {
+    pomo_phase = POMO_IDLE;
+    pomo_last_shown = -1;
+    pomo_set_idle_ui();
+}
+
+bool ui_pomodoro_is_active(void) {
+    return pomo_phase != POMO_IDLE;
+}
+
+bool ui_pomodoro_is_focus(void) {
+    return pomo_phase == POMO_FOCUS;
+}
+
+void ui_tick_pomodoro(void) {
+    if (pomo_phase == POMO_IDLE) return;
+
+    if (pomo_phase == POMO_CELEBRATE) {
+        if (millis() >= pomo_end_ms) {
+            pomo_phase = POMO_BREAK;
+            pomo_duration_ms = POMO_BREAK_MS;
+            pomo_end_ms = millis() + pomo_duration_ms;
+            pomo_last_shown = -1;
+            pomo_set_break_ui();
+            ui_show_screen(SCREEN_POMODORO);
+        }
+        return;
+    }
+
+    int32_t diff = (int32_t)(pomo_end_ms - millis());
+    int remaining_sec = (diff > 0) ? (diff / 1000) : 0;
+
+    if (remaining_sec == pomo_last_shown) return;
+    pomo_last_shown = remaining_sec;
+
+    if (remaining_sec > 0) {
+        int m = remaining_sec / 60;
+        int s = remaining_sec % 60;
+        lv_label_set_text_fmt(lbl_pomo_big, "%02d:%02d", m, s);
+
+        uint32_t elapsed = pomo_duration_ms - (uint32_t)(diff > 0 ? diff : 0);
+        int arc_val = (int)((uint64_t)elapsed * 1000 / pomo_duration_ms);
+        if (arc_val > 1000) arc_val = 1000;
+        lv_arc_set_value(pomo_arc, arc_val);
+        return;
+    }
+
+    // Phase complete
+    lv_arc_set_value(pomo_arc, 1000);
+
+    if (pomo_phase == POMO_FOCUS) {
+        pomo_phase = POMO_CELEBRATE;
+        pomo_end_ms = millis() + POMO_CELEBRATE_MS;
+        lv_label_set_text(lbl_pomo_big, "00:00");
+        ui_show_screen(SCREEN_SPLASH);
+    } else if (pomo_phase == POMO_BREAK) {
+        pomo_phase = POMO_IDLE;
+        pomo_set_idle_ui();
+    }
 }

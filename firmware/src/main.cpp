@@ -335,6 +335,7 @@ void loop() {
     ui_tick_countdown();
     ui_tick_clock();
     ui_tick_chat();
+    ui_tick_pomodoro();
     ui_tick_nudge();
     ble_tick();
     power_tick();
@@ -363,7 +364,11 @@ void loop() {
 
         if (power_pwr_pressed()) {
             if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
-            else                                          ui_cycle_screen();
+            else if (ui_get_current_screen() == SCREEN_POMODORO) {
+                if (ui_pomodoro_is_active()) ui_pomodoro_stop();
+                else                         ui_pomodoro_start();
+            }
+            else ui_cycle_screen();
         }
     }
 
@@ -407,7 +412,8 @@ void loop() {
         static uint32_t idle_change_ms = 0;
         static bool     nudge_dismissed = false;
 
-        if (usage.valid && ble_get_state() == BLE_STATE_CONNECTED) {
+        if (usage.valid && ble_get_state() == BLE_STATE_CONNECTED
+            && !ui_pomodoro_is_active()) {
             float cur = usage.session_pct;
             if (fabsf(cur - idle_last_pct) > 0.01f) {
                 idle_last_pct = cur;

@@ -321,6 +321,27 @@ class Session:
             self.chat_busy = False
 
 
+def _notify_quota_refresh(label: str) -> None:
+    """Create a macOS Reminder with immediate alert (pushes to all Apple devices)."""
+    title = f"Claude {label} quota refreshed"
+    script = (
+        'tell application "Reminders"\n'
+        f'  set r to make new reminder in default list with properties '
+        f'{{name:"{title}", priority:1}}\n'
+        '  set due date of r to current date\n'
+        '  set remind me date of r to current date\n'
+        'end tell'
+    )
+    try:
+        subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True, text=True, timeout=10,
+        )
+        log(f"Reminder created: {title}")
+    except (FileNotFoundError, subprocess.TimeoutExpired) as e:
+        log(f"Reminder creation failed: {e}")
+
+
 async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     """Connect to a known address and poll until disconnected or stopped.
 
@@ -346,6 +367,8 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
 
     last_poll = 0.0
     used_successfully = False
+    prev_s: int | None = None
+    prev_w: int | None = None
     try:
         while client.is_connected and not stop_event.is_set():
             now = time.time()
@@ -361,6 +384,12 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                         if await session.write_payload(payload):
                             last_poll = time.time()
                             used_successfully = True
+                            cur_s, cur_w = payload["s"], payload["w"]
+                            if prev_s is not None and prev_s > 0 and cur_s == 0:
+                                _notify_quota_refresh("session")
+                            if prev_w is not None and prev_w > 0 and cur_w == 0:
+                                _notify_quota_refresh("weekly")
+                            prev_s, prev_w = cur_s, cur_w
 
             try:
                 await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)

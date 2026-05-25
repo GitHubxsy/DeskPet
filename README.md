@@ -1,4 +1,4 @@
-# Clawdmeter
+# DeskPet
 
 A small ESP32 dashboard I made for my desk to keep an eye on Claude Code usage.
 
@@ -50,7 +50,7 @@ The macOS host pieces — Python daemon, LaunchAgent, and flash helper — were 
 
 ### Pair the device
 
-After flashing, open **System Settings → Bluetooth** and click *Connect* next to "Clawdmeter". The daemon will discover it on its next scan (~30 s).
+After flashing, open **System Settings → Bluetooth** and click *Connect* next to "DeskPet". The daemon will discover it on its next scan (~30 s).
 
 ### Install the daemon
 
@@ -82,18 +82,18 @@ pio run -t upload --upload-port /dev/ttyACM0
 
 ### Pair the device
 
-After flashing, the device advertises as "Clawdmeter". Pair it once:
+After flashing, the device advertises as "DeskPet". Pair it once:
 
 ```bash
 # Scan for the device
 bluetoothctl scan le
 
-# When "Clawdmeter" appears, pair and trust it
+# When "DeskPet" appears, pair and trust it
 bluetoothctl pair F4:12:FA:C0:8F:E5    # use your device's MAC
 bluetoothctl trust F4:12:FA:C0:8F:E5
 ```
 
-Find the device's MAC with `bluetoothctl scan le` — it advertises as "Clawdmeter".
+Find the device's MAC with `bluetoothctl scan le` — it advertises as "DeskPet".
 
 ### Install the daemon
 

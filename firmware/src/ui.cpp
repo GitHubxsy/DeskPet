@@ -162,8 +162,8 @@ static uint32_t pomo_end_ms = 0;
 static uint32_t pomo_duration_ms = 0;
 static int      pomo_last_shown = -1;
 
-#define POMO_FOCUS_MS     (10 * 1000UL)   // DEMO: 10s instead of 25min
-#define POMO_BREAK_MS     ( 5 * 1000UL)   // DEMO: 5s instead of 5min
+#define POMO_FOCUS_MS     (25 * 60 * 1000UL)
+#define POMO_BREAK_MS     ( 5 * 60 * 1000UL)
 #define POMO_CELEBRATE_MS 5000UL
 
 // ---- Battery indicator (shared, on top) ----

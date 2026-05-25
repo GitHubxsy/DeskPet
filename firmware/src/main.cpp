@@ -364,9 +364,8 @@ void loop() {
 
         if (power_pwr_pressed()) {
             if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
-            else if (ui_get_current_screen() == SCREEN_POMODORO) {
-                if (ui_pomodoro_is_active()) ui_pomodoro_stop();
-                else                         ui_pomodoro_start();
+            else if (ui_get_current_screen() == SCREEN_POMODORO && ui_pomodoro_is_active()) {
+                ui_pomodoro_stop();
             }
             else ui_cycle_screen();
         }
@@ -424,7 +423,7 @@ void loop() {
                 idle_change_ms = millis();
                 nudge_dismissed = false;
             } else if (!nudge_dismissed && !ui_nudge_is_visible() &&
-                       millis() - idle_change_ms > 5000UL) {  // DEMO: 5s instead of 5min
+                       millis() - idle_change_ms > 300000UL) {
                 ui_show_nudge();
                 nudge_dismissed = true;
             }

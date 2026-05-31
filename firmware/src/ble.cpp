@@ -306,6 +306,56 @@ void ble_send_open_app(void) {
     }
 }
 
+void ble_send_light_power(bool on) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v = on ? 0x30 : 0x31;
+        req_char->setValue(&v, 1);
+        req_char->notify();
+        Serial.printf("BLE: light %s requested\n", on ? "on" : "off");
+    }
+}
+
+void ble_send_light_brightness(uint8_t brightness) {
+    if (brightness < 1) brightness = 1;
+    if (brightness > 100) brightness = 100;
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v[2] = {0x32, brightness};
+        req_char->setValue(v, sizeof(v));
+        req_char->notify();
+        Serial.printf("BLE: light brightness %u requested\n", brightness);
+    }
+}
+
+void ble_send_light_color(uint8_t r, uint8_t g, uint8_t b) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v[4] = {0x33, r, g, b};
+        req_char->setValue(v, sizeof(v));
+        req_char->notify();
+        Serial.printf("BLE: light color #%02x%02x%02x requested\n", r, g, b);
+    }
+}
+
+void ble_send_light_scene(uint8_t brightness, uint8_t r, uint8_t g, uint8_t b) {
+    if (brightness < 1) brightness = 1;
+    if (brightness > 100) brightness = 100;
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v[5] = {0x34, brightness, r, g, b};
+        req_char->setValue(v, sizeof(v));
+        req_char->notify();
+        Serial.printf("BLE: light scene %u%% #%02x%02x%02x requested\n",
+                      brightness, r, g, b);
+    }
+}
+
+void ble_send_light_alert_red(void) {
+    if (state == BLE_STATE_CONNECTED && req_char) {
+        uint8_t v = 0x35;
+        req_char->setValue(&v, 1);
+        req_char->notify();
+        Serial.println("BLE: light red alert requested");
+    }
+}
+
 void ble_keyboard_press(uint8_t key, uint8_t modifier) {
     if (state != BLE_STATE_CONNECTED || !input_kbd) return;
     // HID report: [modifier, reserved, key1, key2, key3, key4, key5, key6]

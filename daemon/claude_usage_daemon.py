@@ -6,6 +6,8 @@ ESP32 "Clawdmeter" peripheral over a custom GATT service. Uses
 bleak (CoreBluetooth backend on macOS).
 """
 
+from __future__ import annotations
+
 import asyncio
 import getpass
 import json
@@ -26,6 +28,11 @@ try:
 except ImportError:
     deepseek_chat = None
 
+try:
+    from yeelight import Bulb
+except ImportError:
+    Bulb = None
+
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
 RX_CHAR_UUID = "4c41555a-4465-7669-6365-000000000002"
@@ -40,6 +47,7 @@ SCAN_TIMEOUT = 8.0
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
+YEELIGHT_IP = os.environ.get("CLAWDMETER_YEELIGHT_IP", "192.168.5.117")
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -235,11 +243,18 @@ class Session:
         self.client = client
         self.refresh_requested = asyncio.Event()
         self.write_lock = asyncio.Lock()
+        self.light_lock = asyncio.Lock()
         self.chat_busy = False
         self._chat_task: asyncio.Task | None = None
 
     def _on_req(self, _char, data: bytearray) -> None:
-        """REQ-characteristic notify handler. 0x01 = refresh, 0x10+ = chat, 0x20 = open app."""
+        """REQ notify handler.
+
+        0x01 = refresh, 0x10+ = chat, 0x20 = open app,
+        0x30/0x31 = light on/off, 0x32 + pct = brightness,
+        0x33 + r/g/b = color, 0x34 + pct/r/g/b = scene,
+        0x35 = red alert flash.
+        """
         if not data:
             return
         code = data[0]
@@ -257,6 +272,18 @@ class Session:
                     subprocess.Popen(["xdg-open", "https://claude.ai"])
             except OSError as e:
                 log(f"Failed to open Claude: {e}")
+        elif code == 0x30:
+            asyncio.create_task(self.handle_light("on"))
+        elif code == 0x31:
+            asyncio.create_task(self.handle_light("off"))
+        elif code == 0x32 and len(data) >= 2:
+            asyncio.create_task(self.handle_light("brightness", data[1]))
+        elif code == 0x33 and len(data) >= 4:
+            asyncio.create_task(self.handle_light("color", (data[1], data[2], data[3])))
+        elif code == 0x34 and len(data) >= 5:
+            asyncio.create_task(self.handle_light("scene", (data[1], data[2], data[3], data[4])))
+        elif code == 0x35:
+            asyncio.create_task(self.handle_light("alert_red"))
         else:
             log(f"Unknown REQ code: {code:#x}")
 
@@ -319,6 +346,90 @@ class Session:
             await self._write(b"\x04")
         finally:
             self.chat_busy = False
+
+    async def handle_light(self, action: str, value=None) -> None:
+        async with self.light_lock:
+            try:
+                await asyncio.to_thread(_run_light_command, action, value)
+            except Exception as e:  # noqa: BLE001
+                log(f"Light command failed ({action}): {e}")
+
+
+def _run_light_command(action: str, value=None) -> None:
+    if Bulb is None:
+        raise RuntimeError("yeelight package is not installed")
+
+    bulb = Bulb(YEELIGHT_IP)
+    if action == "on":
+        bulb.turn_on()
+        log(f"Light on: {YEELIGHT_IP}")
+    elif action == "off":
+        bulb.turn_off()
+        log(f"Light off: {YEELIGHT_IP}")
+    elif action == "brightness":
+        pct = int(value or 50)
+        pct = max(1, min(100, pct))
+        bulb.turn_on()
+        bulb.set_brightness(pct)
+        log(f"Light brightness {pct}%: {YEELIGHT_IP}")
+    elif action == "color":
+        r, g, b = value
+        r = max(0, min(255, int(r)))
+        g = max(0, min(255, int(g)))
+        b = max(0, min(255, int(b)))
+        bulb.turn_on()
+        bulb.set_rgb(r, g, b)
+        log(f"Light color #{r:02x}{g:02x}{b:02x}: {YEELIGHT_IP}")
+    elif action == "scene":
+        brightness, r, g, b = value
+        pct = max(1, min(100, int(brightness)))
+        r = max(0, min(255, int(r)))
+        g = max(0, min(255, int(g)))
+        b = max(0, min(255, int(b)))
+        bulb.turn_on()
+        bulb.set_rgb(r, g, b)
+        bulb.set_brightness(pct)
+        log(f"Light scene {pct}% #{r:02x}{g:02x}{b:02x}: {YEELIGHT_IP}")
+    elif action == "alert_red":
+        _flash_red_alert(bulb)
+    else:
+        raise ValueError(f"unknown light action {action!r}")
+
+
+def _flash_red_alert(bulb) -> None:
+    props = {}
+    try:
+        props = bulb.get_properties(["power", "bright", "rgb"])
+    except Exception as e:  # noqa: BLE001
+        log(f"Light alert restore snapshot failed: {e}")
+
+    was_on = props.get("power") == "on"
+    prev_bright = _parse_int(props.get("bright") or props.get("current_brightness"), 50)
+    prev_rgb = _parse_int(props.get("rgb"), None)
+
+    bulb.turn_on()
+    bulb.set_rgb(255, 0, 0)
+    bulb.set_brightness(100)
+    time.sleep(0.35)
+
+    if not was_on:
+        bulb.turn_off()
+        log(f"Light red alert flashed, restored off: {YEELIGHT_IP}")
+        return
+
+    if prev_rgb is not None:
+        bulb.set_rgb((prev_rgb >> 16) & 0xFF, (prev_rgb >> 8) & 0xFF, prev_rgb & 0xFF)
+    bulb.set_brightness(max(1, min(100, prev_bright)))
+    log(f"Light red alert flashed, restored on: {YEELIGHT_IP}")
+
+
+def _parse_int(value, default):
+    try:
+        if value is None:
+            return default
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def _notify_quota_refresh(label: str) -> None:

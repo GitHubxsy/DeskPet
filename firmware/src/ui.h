@@ -7,6 +7,7 @@ enum screen_t {
     SCREEN_COUNTDOWN,
     SCREEN_CLOCK,
     SCREEN_CHAT,
+    SCREEN_LIGHT,
     SCREEN_POMODORO,
     SCREEN_COUNT,
 };
@@ -33,3 +34,4 @@ void ui_pomodoro_start(void);
 void ui_pomodoro_stop(void);
 bool ui_pomodoro_is_active(void);
 bool ui_pomodoro_is_focus(void);
+void ui_light_apply_clawd_rate(int group);

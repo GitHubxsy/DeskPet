@@ -18,6 +18,8 @@
 #define BTN_BACK 0
 #define BTN_FWD  18
 
+#define IDLE_NUDGE_MS 300000UL
+
 // ---- Hardware objects ----
 Arduino_DataBus *bus = new Arduino_ESP32QSPI(
     LCD_CS, LCD_SCLK, LCD_SDIO0, LCD_SDIO1, LCD_SDIO2, LCD_SDIO3);
@@ -399,6 +401,7 @@ void loop() {
                 if (splash_is_active()) splash_pick_for_current_rate();
             }
             ui_update(&usage);
+            if (splash_is_active()) ui_light_apply_clawd_rate(g_after);
             ble_send_ack();
         } else {
             ble_send_nack();
@@ -423,7 +426,7 @@ void loop() {
                 idle_change_ms = millis();
                 nudge_dismissed = false;
             } else if (!nudge_dismissed && !ui_nudge_is_visible() &&
-                       millis() - idle_change_ms > 300000UL) {
+                       millis() - idle_change_ms > IDLE_NUDGE_MS) {
                 ui_show_nudge();
                 nudge_dismissed = true;
             }

@@ -30,6 +30,13 @@ bool ble_chat_has_error(void);
 // Request the host to open the Claude app
 void ble_send_open_app(void);
 
+// Yeelight control — executed by the host daemon.
+void ble_send_light_power(bool on);
+void ble_send_light_brightness(uint8_t brightness);
+void ble_send_light_color(uint8_t r, uint8_t g, uint8_t b);
+void ble_send_light_scene(uint8_t brightness, uint8_t r, uint8_t g, uint8_t b);
+void ble_send_light_alert_red(void);
+
 // BLE HID keyboard
 void ble_keyboard_press(uint8_t key, uint8_t modifier);
 void ble_keyboard_release(void);

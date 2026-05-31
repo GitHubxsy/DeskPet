@@ -3,9 +3,11 @@
 #include "ble.h"
 #include <lvgl.h>
 #include <esp_heap_caps.h>
+#include <string.h>
 #include "logo.h"
 #include "icons.h"
 #include "display_cfg.h"
+#include "usage_rate.h"
 
 // Custom fonts (scaled for 314 PPI, ~1.9x from original 165 PPI)
 LV_FONT_DECLARE(font_tiempos_56);
@@ -97,6 +99,44 @@ static const char* const chat_questions[] = {
     "What can you do?",
 };
 #define CHAT_QUESTION_COUNT 4
+
+// ---- Light screen widgets ----
+static lv_obj_t* light_container;
+static lv_obj_t* light_on_btn;
+static lv_obj_t* light_off_btn;
+static lv_obj_t* light_bar;
+static lv_obj_t* lbl_light_pct;
+static lv_obj_t* lbl_light_state;
+static lv_obj_t* lbl_light_status;
+
+struct light_color_preset_t {
+    const char* name;
+    uint8_t r;
+    uint8_t g;
+    uint8_t b;
+    uint32_t hex;
+};
+
+static const light_color_preset_t light_colors[] = {
+    {"red",    255,  56,  48, 0xff3830},
+    {"green",   64, 201,  92, 0x40c95c},
+    {"blue",    10, 132, 255, 0x0a84ff},
+    {"yellow", 255, 214,  10, 0xffd60a},
+    {"purple", 191,  90, 242, 0xbf5af2},
+    {"white",  255, 244, 229, 0xfff4e5},
+};
+#define LIGHT_COLOR_COUNT (sizeof(light_colors) / sizeof(light_colors[0]))
+#define LIGHT_RED_IDX    0
+#define LIGHT_GREEN_IDX  1
+#define LIGHT_YELLOW_IDX 3
+#define LIGHT_WHITE_IDX  5
+
+static lv_obj_t* light_color_btns[LIGHT_COLOR_COUNT];
+static bool light_on = false;
+static uint8_t light_brightness = 50;
+static uint8_t light_color_idx = 5;
+static bool quota_limited_seen = false;
+static int clawd_light_sent_group = -1;
 
 // ---- Nudge overlay (idle reminder — finger + Claude animation, on top of everything) ----
 static lv_obj_t* nudge_overlay = nullptr;
@@ -618,6 +658,228 @@ void ui_tick_chat(void) {
     }
 }
 
+// ======== Light Screen (480x480) ========
+
+static void light_refresh_ui(void) {
+    lv_obj_set_style_bg_color(light_on_btn, light_on ? COL_GREEN : COL_PANEL, 0);
+    lv_obj_set_style_bg_color(light_off_btn, light_on ? COL_PANEL : COL_RED, 0);
+    lv_label_set_text(lbl_light_state, light_on ? "ON" : "OFF");
+    lv_obj_set_style_text_color(lbl_light_state, light_on ? COL_GREEN : COL_DIM, 0);
+
+    lv_bar_set_value(light_bar, light_brightness, LV_ANIM_ON);
+    lv_obj_set_style_bg_color(light_bar, lv_color_hex(light_colors[light_color_idx].hex), LV_PART_INDICATOR);
+    lv_label_set_text_fmt(lbl_light_pct, "%u%%", light_brightness);
+
+    for (size_t i = 0; i < LIGHT_COLOR_COUNT; ++i) {
+        if (!light_color_btns[i]) continue;
+        bool selected = (i == light_color_idx);
+        lv_obj_set_style_border_width(light_color_btns[i], selected ? 4 : 2, 0);
+        lv_obj_set_style_border_color(light_color_btns[i], selected ? COL_TEXT : COL_BAR_BG, 0);
+    }
+}
+
+static lv_obj_t* make_light_button(lv_obj_t* parent, int x, int y, int w, int h,
+                                   const char* text, lv_event_cb_t cb, void* user_data) {
+    lv_obj_t* btn = lv_obj_create(parent);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_bg_color(btn, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_border_width(btn, 0, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(btn, cb, LV_EVENT_CLICKED, user_data);
+
+    lv_obj_t* lbl = lv_label_create(btn);
+    lv_label_set_text(lbl, text);
+    lv_obj_set_style_text_font(lbl, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(lbl, COL_TEXT, 0);
+    lv_obj_center(lbl);
+    return btn;
+}
+
+static bool light_ble_ready(void) {
+    if (ble_get_state() == BLE_STATE_CONNECTED) return true;
+    lv_label_set_text(lbl_light_status, "BLE offline");
+    return false;
+}
+
+static void light_on_click_cb(lv_event_t* e) {
+    (void)e;
+    light_on = true;
+    light_refresh_ui();
+    if (light_ble_ready()) {
+        lv_label_set_text(lbl_light_status, "Sent: on");
+        ble_send_light_power(true);
+    }
+}
+
+static void light_off_click_cb(lv_event_t* e) {
+    (void)e;
+    light_on = false;
+    light_refresh_ui();
+    if (light_ble_ready()) {
+        lv_label_set_text(lbl_light_status, "Sent: off");
+        ble_send_light_power(false);
+    }
+}
+
+static void light_brightness_click_cb(lv_event_t* e) {
+    intptr_t delta = (intptr_t)lv_event_get_user_data(e);
+    int next = (delta == 1000) ? 100 : (int)light_brightness + (int)delta;
+    if (next < 1) next = 1;
+    if (next > 100) next = 100;
+    light_brightness = (uint8_t)next;
+    light_on = true;
+    light_refresh_ui();
+    if (light_ble_ready()) {
+        lv_label_set_text_fmt(lbl_light_status, "Sent: %u%%", light_brightness);
+        ble_send_light_brightness(light_brightness);
+    }
+}
+
+static void light_apply_auto_scene(const char* status, uint8_t color_idx, uint8_t brightness) {
+    if (!light_container || color_idx >= LIGHT_COLOR_COUNT) return;
+    if (brightness < 1) brightness = 1;
+    if (brightness > 100) brightness = 100;
+
+    const light_color_preset_t* c = &light_colors[color_idx];
+    light_on = true;
+    light_brightness = brightness;
+    light_color_idx = color_idx;
+    light_refresh_ui();
+
+    if (ble_get_state() != BLE_STATE_CONNECTED) {
+        lv_label_set_text(lbl_light_status, "Auto: BLE offline");
+        return;
+    }
+
+    lv_label_set_text(lbl_light_status, status);
+    ble_send_light_scene(brightness, c->r, c->g, c->b);
+}
+
+static void light_flash_quota_alert(void) {
+    if (!light_container) return;
+    if (ble_get_state() != BLE_STATE_CONNECTED) {
+        lv_label_set_text(lbl_light_status, "Alert: BLE offline");
+        return;
+    }
+
+    lv_label_set_text(lbl_light_status, "Alert: quota");
+    ble_send_light_alert_red();
+}
+
+void ui_light_apply_clawd_rate(int group) {
+    if (pomo_phase != POMO_IDLE) return;
+    if (ble_get_state() != BLE_STATE_CONNECTED) {
+        clawd_light_sent_group = -1;
+        return;
+    }
+    if (group == clawd_light_sent_group) return;
+
+    switch (group) {
+    case 0:
+        light_apply_auto_scene("Clawd: idle", LIGHT_WHITE_IDX, 35);
+        break;
+    case 1:
+        light_apply_auto_scene("Clawd: normal", LIGHT_GREEN_IDX, 45);
+        break;
+    case 2:
+        light_apply_auto_scene("Clawd: active", LIGHT_YELLOW_IDX, 60);
+        break;
+    default:
+        light_apply_auto_scene("Clawd: heavy", LIGHT_RED_IDX, 80);
+        break;
+    }
+    clawd_light_sent_group = group;
+}
+
+static void light_color_click_cb(lv_event_t* e) {
+    intptr_t idx = (intptr_t)lv_event_get_user_data(e);
+    if (idx < 0 || idx >= (intptr_t)LIGHT_COLOR_COUNT) return;
+    light_color_idx = (uint8_t)idx;
+    light_on = true;
+    light_refresh_ui();
+    if (light_ble_ready()) {
+        const light_color_preset_t* c = &light_colors[light_color_idx];
+        lv_label_set_text_fmt(lbl_light_status, "Sent: %s", c->name);
+        ble_send_light_color(c->r, c->g, c->b);
+    }
+}
+
+static lv_obj_t* make_light_swatch(lv_obj_t* parent, int x, int y, int w, int h, size_t idx) {
+    lv_obj_t* btn = lv_obj_create(parent);
+    lv_obj_set_pos(btn, x, y);
+    lv_obj_set_size(btn, w, h);
+    lv_obj_set_style_bg_color(btn, lv_color_hex(light_colors[idx].hex), 0);
+    lv_obj_set_style_bg_opa(btn, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(btn, 8, 0);
+    lv_obj_set_style_border_width(btn, 2, 0);
+    lv_obj_set_style_border_color(btn, COL_BAR_BG, 0);
+    lv_obj_clear_flag(btn, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_event_cb(btn, light_color_click_cb, LV_EVENT_CLICKED, (void*)(intptr_t)idx);
+    return btn;
+}
+
+static void init_light_screen(lv_obj_t* scr) {
+    light_container = lv_obj_create(scr);
+    lv_obj_set_size(light_container, SCR_W, SCR_H);
+    lv_obj_set_pos(light_container, 0, 0);
+    lv_obj_set_style_bg_opa(light_container, LV_OPA_TRANSP, 0);
+    lv_obj_set_style_border_width(light_container, 0, 0);
+    lv_obj_set_style_pad_all(light_container, 0, 0);
+    lv_obj_clear_flag(light_container, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* title = lv_label_create(light_container);
+    lv_label_set_text(title, "Light");
+    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
+    lv_obj_set_style_text_color(title, COL_TEXT, 0);
+    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+
+    light_on_btn = make_light_button(light_container, MARGIN, CONTENT_Y,
+                                     (CONTENT_W - 16) / 2, 74,
+                                     "On", light_on_click_cb, NULL);
+    light_off_btn = make_light_button(light_container,
+                                      MARGIN + (CONTENT_W - 16) / 2 + 16, CONTENT_Y,
+                                      (CONTENT_W - 16) / 2, 74,
+                                      "Off", light_off_click_cb, NULL);
+
+    lv_obj_t* panel = make_panel(light_container, MARGIN, CONTENT_Y + 88, CONTENT_W, 136);
+
+    lbl_light_state = lv_label_create(panel);
+    lv_label_set_text(lbl_light_state, "OFF");
+    lv_obj_set_style_text_font(lbl_light_state, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(lbl_light_state, COL_DIM, 0);
+    lv_obj_set_pos(lbl_light_state, 0, 0);
+
+    lbl_light_pct = lv_label_create(panel);
+    lv_label_set_text(lbl_light_pct, "50%");
+    lv_obj_set_style_text_font(lbl_light_pct, &font_styrene_48, 0);
+    lv_obj_set_style_text_color(lbl_light_pct, COL_TEXT, 0);
+    lv_obj_align(lbl_light_pct, LV_ALIGN_TOP_RIGHT, 0, -2);
+
+    light_bar = make_bar(panel, 0, 48, CONTENT_W - 32, 18);
+    lv_obj_set_style_bg_color(light_bar, COL_ACCENT, LV_PART_INDICATOR);
+
+    make_light_button(panel, 0, 78, 124, 38, "-10", light_brightness_click_cb, (void*)(intptr_t)-10);
+    make_light_button(panel, 142, 78, 124, 38, "+10", light_brightness_click_cb, (void*)(intptr_t)10);
+    make_light_button(panel, 284, 78, 124, 38, "100", light_brightness_click_cb, (void*)(intptr_t)1000);
+
+    lv_obj_t* color_panel = make_panel(light_container, MARGIN, CONTENT_Y + 238, CONTENT_W, 90);
+    for (size_t i = 0; i < LIGHT_COLOR_COUNT; ++i) {
+        light_color_btns[i] = make_light_swatch(color_panel, (int)i * 71, 6, 54, 54, i);
+    }
+
+    lbl_light_status = lv_label_create(light_container);
+    lv_label_set_text(lbl_light_status, "192.168.5.117");
+    lv_obj_set_style_text_font(lbl_light_status, &font_styrene_20, 0);
+    lv_obj_set_style_text_color(lbl_light_status, COL_DIM, 0);
+    lv_obj_align(lbl_light_status, LV_ALIGN_BOTTOM_MID, 0, -20);
+
+    light_refresh_ui();
+    lv_obj_add_flag(light_container, LV_OBJ_FLAG_HIDDEN);
+}
+
 // ======== Pomodoro Screen (480x480) ========
 
 static void pomo_click_cb(lv_event_t* e) {
@@ -756,6 +1018,7 @@ void ui_init(void) {
     init_countdown_screen(scr);
     init_clock_screen(scr);
     init_chat_screen(scr);
+    init_light_screen(scr);
     init_pomodoro_screen(scr);
     splash_init(scr);
 
@@ -828,6 +1091,14 @@ void ui_update(const UsageData* data) {
     }
     clock_last_shown = -1;
     if (data->date_str[0]) lv_label_set_text(lbl_clock_date, data->date_str);
+
+    bool limited = (strcmp(data->status, "limited") == 0) ||
+                   data->session_pct >= 99.5f ||
+                   data->weekly_pct >= 99.5f;
+    if (limited && !quota_limited_seen) {
+        light_flash_quota_alert();
+    }
+    quota_limited_seen = limited;
 }
 
 void ui_tick_anim(void) {
@@ -920,11 +1191,15 @@ void ui_show_screen(screen_t screen) {
     lv_obj_add_flag(countdown_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(clock_container, LV_OBJ_FLAG_HIDDEN);
     lv_obj_add_flag(chat_container, LV_OBJ_FLAG_HIDDEN);
+    lv_obj_add_flag(light_container, LV_OBJ_FLAG_HIDDEN);
     if (pomo_container) lv_obj_add_flag(pomo_container, LV_OBJ_FLAG_HIDDEN);
     splash_hide();
 
     switch (screen) {
-    case SCREEN_SPLASH:     splash_show(); break;
+    case SCREEN_SPLASH:
+        splash_show();
+        ui_light_apply_clawd_rate(usage_rate_group());
+        break;
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_COUNTDOWN:
         lv_obj_clear_flag(countdown_container, LV_OBJ_FLAG_HIDDEN);
@@ -937,6 +1212,9 @@ void ui_show_screen(screen_t screen) {
     case SCREEN_CHAT:
         lv_obj_clear_flag(chat_container, LV_OBJ_FLAG_HIDDEN);
         chat_set_state(CHAT_STATE_LIST);
+        break;
+    case SCREEN_LIGHT:
+        lv_obj_clear_flag(light_container, LV_OBJ_FLAG_HIDDEN);
         break;
     case SCREEN_POMODORO:
         lv_obj_clear_flag(pomo_container, LV_OBJ_FLAG_HIDDEN);
@@ -962,7 +1240,8 @@ void ui_cycle_screen(void) {
     case SCREEN_USAGE:     next = SCREEN_COUNTDOWN; break;
     case SCREEN_COUNTDOWN: next = SCREEN_CLOCK; break;
     case SCREEN_CLOCK:     next = SCREEN_CHAT; break;
-    case SCREEN_CHAT:      next = SCREEN_POMODORO; break;
+    case SCREEN_CHAT:      next = SCREEN_LIGHT; break;
+    case SCREEN_LIGHT:     next = SCREEN_POMODORO; break;
     case SCREEN_POMODORO:  next = SCREEN_USAGE; break;
     default:               next = SCREEN_USAGE; break;
     }
@@ -1073,6 +1352,8 @@ void ui_pomodoro_start(void) {
     pomo_end_ms = millis() + pomo_duration_ms;
     pomo_last_shown = -1;
     pomo_set_focus_ui();
+    clawd_light_sent_group = -1;
+    light_apply_auto_scene("Scene: focus", LIGHT_WHITE_IDX, 100);
     ui_show_screen(SCREEN_POMODORO);
 }
 
@@ -1080,6 +1361,8 @@ void ui_pomodoro_stop(void) {
     pomo_phase = POMO_IDLE;
     pomo_last_shown = -1;
     pomo_set_idle_ui();
+    clawd_light_sent_group = -1;
+    light_apply_auto_scene("Scene: idle", LIGHT_WHITE_IDX, 45);
 }
 
 bool ui_pomodoro_is_active(void) {
@@ -1100,6 +1383,8 @@ void ui_tick_pomodoro(void) {
             pomo_end_ms = millis() + pomo_duration_ms;
             pomo_last_shown = -1;
             pomo_set_break_ui();
+            clawd_light_sent_group = -1;
+            light_apply_auto_scene("Scene: break", LIGHT_GREEN_IDX, 40);
             ui_show_screen(SCREEN_POMODORO);
         }
         return;
@@ -1134,5 +1419,7 @@ void ui_tick_pomodoro(void) {
     } else if (pomo_phase == POMO_BREAK) {
         pomo_phase = POMO_IDLE;
         pomo_set_idle_ui();
+        clawd_light_sent_group = -1;
+        light_apply_auto_scene("Scene: idle", LIGHT_WHITE_IDX, 45);
     }
 }

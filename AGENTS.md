@@ -91,6 +91,8 @@ See `~/.Codex/projects/.../memory/` files for persistent context (user is an emb
 
 Bash daemon (`daemon/Codex-usage-daemon.sh`) reads OAuth token, polls Anthropic API, sends JSON over BLE GATT. Run with `systemctl --user start Codex-usage-daemon`. The unit file's `ExecStart` is the absolute path to the script — repoint it when switching between the worktree and the main checkout.
 
+**macOS launchd gotcha:** the active LaunchAgent currently runs `~/.clawdmeter-daemon/.venv/bin/python ~/.clawdmeter-daemon/claude_usage_daemon.py`, not the checkout copy at `daemon/claude_usage_daemon.py`. When changing daemon behavior on this Mac, update/sync `~/.clawdmeter-daemon/claude_usage_daemon.py`, install dependencies into `~/.clawdmeter-daemon/.venv`, and restart `com.user.claude-usage-daemon`.
+
 **Discovery & resilience:**
 
 - Connects by name (`"Codex Controller"`) on first run, caches resolved MAC at `~/.config/Codex-usage-monitor/ble-address`. ESP32 BLE addresses are factory-burned per-chip, so swapping any board invalidates the cache.

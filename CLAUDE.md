@@ -91,6 +91,8 @@ See `~/.claude/projects/.../memory/` files for persistent context (user is an em
 
 Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic API, sends JSON over BLE GATT. Run with `systemctl --user start claude-usage-daemon`. The unit file's `ExecStart` is the absolute path to the script — repoint it when switching between the worktree and the main checkout.
 
+**macOS launchd gotcha:** the active LaunchAgent currently runs `~/.clawdmeter-daemon/.venv/bin/python ~/.clawdmeter-daemon/claude_usage_daemon.py`, not the checkout copy at `daemon/claude_usage_daemon.py`. When changing daemon behavior on this Mac, update/sync `~/.clawdmeter-daemon/claude_usage_daemon.py`, install dependencies into `~/.clawdmeter-daemon/.venv`, and restart `com.user.claude-usage-daemon`.
+
 **Discovery & resilience:**
 
 - Connects by name (`"Claude Controller"`) on first run, caches resolved MAC at `~/.config/claude-usage-monitor/ble-address`. ESP32 BLE addresses are factory-burned per-chip, so swapping any board invalidates the cache.

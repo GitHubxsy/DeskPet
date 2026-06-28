@@ -1,147 +1,243 @@
 # DeskPet
 
-A desk-side pet that monitors your Claude Code usage on a 480×480 AMOLED screen — and nudges you when you slack off.
+DeskPet is a desk-side voice companion for Claude Code: a tiny animated pet on a
+480×480 AMOLED screen that listens through an ESP32-S3 microphone, talks back
+through your Mac, controls a Yeelight smart color bulb, and still keeps the
+original Claude usage dashboard one middle-button press away.
 
-It runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786), pairs with your laptop over Bluetooth, and plays pixel-art Clawd animations that match your coding intensity. The two side buttons send keyboard shortcuts over BLE HID for Claude Code's voice mode and mode toggle.
+It runs on a [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786),
+pairs with a host daemon over Bluetooth LE, and uses DeskPet MP4 animations for
+idle, listening, transcribing, speaking, charging, low-battery, and mood states.
 
-|              Splash              |              Usage              |
-| :------------------------------: | :------------------------------: |
+DeskPet introduction page: [https://deskpet.pages.dev](https://deskpet.pages.dev/)
+
+| Opening Loop | Usage |
+| :----------: | :---: |
 | ![Splash](screenshots/splash.png) | ![Usage](screenshots/usage.png) |
 
-The Clawd animations come from [claudepix](https://claudepix.vercel.app) by [@amaanbuilds](https://x.com/amaanbuilds).
+## What Changed
+
+This project has been upgraded from a Claude usage monitor into a voice-first
+desktop pet:
+
+- **Voice conversation as the main flow**: left button enters Chat; hold left to
+  record; release to transcribe; DeskPet answers with speech.
+- **Smart branching state machine**:
+  `Idle -> Listening -> Transcribing -> Speaking -> Idle`.
+- **Lamp command branch**:
+  `Idle -> Listening -> Transcribing -> Lamp done -> Idle`.
+- **Short-recording recovery**:
+  `Voice too short` stays visible for 3 seconds, then returns to Idle.
+- **DeskPet MP4 animation system**: all animations under `logo/DeskPet-mp4/`
+  are generated into compressed firmware assets and rendered on device.
+- **Natural-language Yeelight control**: say things like "把台灯调成柔和绿光".
+- **AI fallback chat**: non-lamp voice input is answered through DeepSeek, then
+  spoken with DashScope TTS.
+- **Claude usage dashboard remains**: usage, countdown, clock, Pomodoro, light,
+  and nudge screens still exist behind the main DeskPet experience.
+
+## DeskPet States
+
+Opening page cycles through six core moods:
+
+`idle -> happy -> sleepy -> curious -> angry -> love`
+
+Voice and power states use the rest of the catalog:
+
+- `listening` while the left button is held
+- `transcribing` after release while ASR runs
+- `speaking` while the host plays TTS
+- `charging` when the battery is charging on the Chat idle screen
+- `low-battery` when the battery is low on the Chat idle screen
+
+The animation source catalog lives here:
+
+```text
+logo/DeskPet-mp4/
+01-idle.mp4
+02-happy.mp4
+03-sleepy.mp4
+04-curious.mp4
+05-angry.mp4
+06-love.mp4
+07-charging.mp4
+08-low-battery.mp4
+09-speaking.mp4
+10-listening.mp4
+11-transcribing.mp4
+```
+
+Regenerate firmware animation assets after replacing MP4 files:
+
+```bash
+python3 tools/generate_deskpet_animations.py
+pio run -d firmware
+```
 
 ## Screens
 
-Press the middle (PWR) button to cycle through screens. Tap the touchscreen to toggle the splash animation on/off.
+Press the middle (PWR) button to move through secondary screens. From Chat,
+the middle button exits back to the opening DeskPet splash page.
 
-|              Countdown              |              Clock              |              Pomodoro              |              Nudge              |
-| :---------------------------------: | :------------------------------: | :--------------------------------: | :------------------------------: |
+| Countdown | Clock | Pomodoro | Nudge |
+| :-------: | :---: | :------: | :---: |
 | ![Countdown](screenshots/countdown.png) | ![Clock](screenshots/clock.png) | ![Pomodoro](screenshots/pomodoro.png) | ![Nudge](screenshots/nudge.png) |
-| Session reset countdown + utilization rings | Host time + date | 25-min focus timer with progress ring | Idle reminder — tap to open Claude |
+| Session reset countdown | Host time + date | Focus timer + break flow | Idle reminder |
 
-### Idle Nudge + Pomodoro
+## Voice Flow
 
-When you stop using Claude for 5 minutes, DeskPet pops up a nudge overlay — a pointing hand and a coding Clawd animation — urging you to get back to work. Tapping the nudge opens Claude on your host **and** starts a 25-minute Pomodoro focus timer. When focus ends, Clawd dances a celebration, then a 5-minute break begins. After the break, if you're idle again, the nudge comes back.
+DeskPet sends microphone audio over BLE to the host daemon:
+
+1. Left button down: firmware switches to `listening` and streams PCM16 chunks.
+2. Left button up: firmware switches to `transcribing` and sends end-of-audio.
+3. The daemon transcribes with DashScope ASR.
+4. If the text is a lamp command, the daemon executes it and sends `speech done`.
+5. Otherwise the daemon asks DeepSeek for a short answer.
+6. The answer is sent to the screen, DashScope TTS plays it on the Mac, then the
+   daemon sends `speech done`.
+7. Firmware returns to Idle.
+
+## Yeelight Lamp Control
+
+The lamp is a Yeelight smart color bulb. The daemon can control power,
+brightness, RGB color, and scene-like presets through natural language.
+
+Examples:
+
+```bash
+~/.clawdmeter-daemon/lightctl "把台灯调成柔和绿光"
+~/.clawdmeter-daemon/lightctl "台灯暖白高亮"
+~/.clawdmeter-daemon/lightctl "关闭台灯"
+```
+
+Voice commands follow the same path. If the transcript is recognized as a lamp
+command, DeskPet skips AI chat and returns to Idle right after the lamp finishes.
 
 ## Hardware
 
-- [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786) — ESP32-S3R8, 480×480 AMOLED, cap touch, PMU, IMU
+- [Waveshare ESP32-S3-Touch-AMOLED-2.16](https://www.waveshare.com/esp32-s3-touch-amoled-2.16.htm?&aff_id=149786)
+  — ESP32-S3R8, 480×480 AMOLED, capacitive touch, PMU, IMU, microphone ADC
+- ES7210 microphone path on the board
+- Yeelight smart color bulb for lamp control
 - USB-C cable for flashing and charging
 - 3.7V Li-Po battery (MX1.25, optional)
 
 ## Prerequisites
 
-- Linux (Ubuntu) or macOS
+- macOS for the current voice/daemon stack
 - [PlatformIO CLI](https://docs.platformio.org/en/latest/core/installation/index.html)
-- Linux: `curl`, `bluetoothctl`, `busctl`
-- macOS: `python3` (the installer sets up a venv with `bleak` and `httpx`)
-- Claude Code with an active subscription
+- Python 3 with venv support
+- Bluetooth permission for the daemon runtime
+- Reminders permission if you use reminder-related daemon features
+- Claude Code credentials for usage polling
+- DashScope API key for ASR/TTS
+- DeepSeek API key for AI chat fallback
+- Yeelight bulb reachable on the local network
 
-## macOS installation
+## macOS Installation
 
-The macOS host pieces — Python daemon, LaunchAgent, and flash helper — were ported by [Chris Davidson (@lorddavidson)](https://github.com/lorddavidson). Thanks Chris!
-
-### Flash the firmware
+### Flash The Firmware
 
 ```bash
-./flash-mac.sh                       # auto-detects /dev/cu.usbmodem*
-./flash-mac.sh /dev/cu.usbmodem1101  # or pass an explicit port
+./flash-mac.sh
+./flash-mac.sh /dev/cu.usbmodem1101
 ```
 
-### Pair the device
+Or directly:
 
-After flashing, open **System Settings → Bluetooth** and click *Connect* next to "DeskPet". The daemon will discover it on its next scan (~30 s).
+```bash
+pio run -d firmware
+pio run -d firmware -t upload --upload-port /dev/cu.usbmodem21101
+```
 
-### Install the daemon
+### Pair The Device
+
+Open **System Settings -> Bluetooth** and connect to `Clawdmeter` / `DeskPet`
+when it appears.
+
+### Install The Daemon
 
 ```bash
 ./install-mac.sh
 ```
 
-The installer creates a Python venv, installs dependencies, renders a LaunchAgent, and loads it. The first run launches interactively so macOS prompts for Bluetooth permission.
+The installer copies runtime files into:
 
-```bash
-launchctl list | grep claude-usage                                          # check status
-tail -F ~/Library/Logs/claude-usage-daemon.out.log                          # live logs
-launchctl unload ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist  # stop
-launchctl load -w ~/Library/LaunchAgents/com.user.claude-usage-daemon.plist # start
+```text
+~/.clawdmeter-daemon/
 ```
 
-## Linux installation
+Important: launchd runs:
 
-### Flash the firmware
-
-```bash
-cd firmware
-pio run -t upload --upload-port /dev/ttyACM0
+```text
+~/.clawdmeter-daemon/.venv/bin/python ~/.clawdmeter-daemon/claude_usage_daemon.py
 ```
 
-### Pair the device
+So when changing daemon behavior on this Mac, update the runtime copy and restart:
 
 ```bash
-bluetoothctl scan le
-# When "DeskPet" appears:
-bluetoothctl pair <MAC>
-bluetoothctl trust <MAC>
+launchctl kickstart -k gui/$(id -u)/com.user.claude-usage-daemon
+tail -F ~/Library/Logs/claude-usage-daemon.out.log
 ```
 
-### Install the daemon
+## Physical Buttons
 
-```bash
-./install.sh
-systemctl --user start claude-usage-daemon
-```
+| Button | GPIO | Function |
+| ------ | ---- | -------- |
+| **Left** | GPIO 0 | Enter Chat; hold to record voice; release to transcribe |
+| **Middle** | AXP2101 PKEY | Cycle screens; from Chat exits to Splash; stops active Pomodoro |
+| **Right** | GPIO 18 | Send Shift+Tab as a BLE HID shortcut |
 
-## How it works
+## BLE Protocol
 
-1. The daemon reads your Claude Code OAuth token.
-2. It makes a minimal API call to `api.anthropic.com/v1/messages` — one token of Haiku, basically free.
-3. Usage numbers come from the response headers (`anthropic-ratelimit-unified-5h-utilization` etc.).
-4. The daemon pushes a JSON payload to the ESP32 over BLE GATT.
-5. The firmware parses it and updates the LVGL UI.
-6. Splash animations are selected by usage rate — idle usage picks sleepy Clawds, heavy usage picks dancing ones.
+DeskPet exposes a custom GATT service alongside HID keyboard support:
 
-## Physical buttons
+| Characteristic | UUID |
+| -------------- | ---- |
+| Data Service | `4c41555a-4465-7669-6365-000000000001` |
+| RX, host writes to device | `4c41555a-4465-7669-6365-000000000002` |
+| TX, device notifies host | `4c41555a-4465-7669-6365-000000000003` |
+| REQ, device notifies host | `4c41555a-4465-7669-6365-000000000004` |
 
-| Button           | GPIO         | Function                                                       |
-| ---------------- | ------------ | -------------------------------------------------------------- |
-| **Left**         | GPIO 0       | Hold to send Space (Claude Code voice-mode push-to-talk)       |
-| **Middle** (PWR) | AXP2101 PKEY | Cycle screens; on Pomodoro screen, stops active timer          |
-| **Right**        | GPIO 18      | Press to send Shift+Tab (Claude Code mode toggle)              |
+Selected protocol tags:
 
-## BLE protocol
+| Direction | Tag | Meaning |
+| --------- | --- | ------- |
+| Device -> Host | `0x50` | Voice start |
+| Device -> Host | `0x51` | Voice PCM16 chunk |
+| Device -> Host | `0x52` | Voice end |
+| Device -> Host | `0x40` | Text command |
+| Host -> Device | `0x02` | Chat text chunk |
+| Host -> Device | `0x04` | Chat text complete |
+| Host -> Device | `0x05` | Speech/action done, return to Idle |
+| Host -> Device | `0x15` | Error text |
 
-Custom GATT service alongside standard HID keyboard:
-
-| Characteristic            | UUID                                   |
-| ------------------------- | -------------------------------------- |
-| Data Service              | `4c41555a-4465-7669-6365-000000000001` |
-| RX (write)                | `4c41555a-4465-7669-6365-000000000002` |
-| TX (notify)               | `4c41555a-4465-7669-6365-000000000003` |
-| HID Service               | `00001812-0000-1000-8000-00805f9b34fb` |
-
-JSON payload written to RX:
+Usage JSON is still written to RX for the dashboard:
 
 ```json
 { "s": 45, "sr": 120, "w": 28, "wr": 7200, "st": "allowed", "t": 52380, "d": "Sat, 17 May 2026", "ok": true }
 ```
 
-## Splash animations
+## Development Notes
 
-Sourced from [claudepix.vercel.app](https://claudepix.vercel.app). Re-pull with:
-
-```bash
-node tools/scrape_claudepix.js
-node tools/convert_to_c.js
-pio run -d firmware -t upload
-```
+- Firmware UI is LVGL 9 on a 480×480 AMOLED.
+- Display rotation is CPU-side pixel remapping; the CO5300 cannot rotate axes
+  through MADCTL.
+- MP4 animations are quantized to 64-color RGB565 palettes and RLE-compressed in
+  `firmware/src/deskpet_animations.h`.
+- Runtime animation decoding lives in `firmware/src/deskpet_anim.cpp`.
+- Serial command `screenshot` dumps the framebuffer for visual QA.
+- Serial command `deskpet 0` through `deskpet 10` previews animation states.
 
 ## Credits
 
-- Pixel-art Clawd animations by [@amaanbuilds](https://x.com/amaanbuilds), from [claudepix.vercel.app](https://claudepix.vercel.app)
+- DeskPet visual assets in `logo/`
 - [Lucide](https://lucide.dev) icon set (MIT) for UI glyphs
 - Anthropic brand fonts (Tiempos Text, Styrene B)
+- macOS host pieces were originally ported by
+  [Chris Davidson (@lorddavidson)](https://github.com/lorddavidson)
 
 ## License
 
-This repo uses Anthropic's proprietary fonts and copyrighted Clawd mascot assets without explicit permission. The code itself is non-proprietary, but **not formally licensed** due to the included proprietary assets. Please be aware of this if you fork or copy.
+This repository includes third-party fonts and visual assets. The code is shared
+for project development, but no formal open-source license is currently declared.

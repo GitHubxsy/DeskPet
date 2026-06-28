@@ -7,7 +7,7 @@
 
 ## 从一个 Python 小实验开始
 
-最开始验证台灯很简单，几行 Python 就能跑通：
+这盏台灯来自 Yeelight 智能彩色灯泡。最开始验证它很简单，几行 Python 就能跑通：
 
 ```python
 from yeelight import Bulb

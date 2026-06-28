@@ -1,4 +1,5 @@
 #pragma once
+#include <stddef.h>
 #include <stdint.h>
 
 enum ble_state_t {
@@ -22,10 +23,19 @@ void ble_request_refresh(void);
 
 // AI chat — request a preset question by index; response arrives in chunks.
 void ble_send_chat_request(uint8_t question_idx);
+void ble_send_text_command(const char* text);
+void ble_chat_reset(void);
 bool ble_chat_has_update(void);   // true once when a new chunk/end/error arrived
 const char* ble_chat_text(void);  // accumulated response text so far
 bool ble_chat_is_complete(void);
 bool ble_chat_has_error(void);
+bool ble_chat_speech_done(void);
+
+// Voice audio — device sends PCM16 chunks to the host for transcription.
+bool ble_send_voice_start(uint16_t sample_rate, uint8_t channels);
+bool ble_send_voice_chunk(uint16_t seq, const uint8_t* data, size_t len);
+bool ble_send_voice_end(void);
+bool ble_send_voice_abort(const char* reason);
 
 // Request the host to open the Claude app
 void ble_send_open_app(void);

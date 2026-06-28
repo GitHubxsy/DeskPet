@@ -1,53 +1,44 @@
-# Splash animation tools
+# DeskPet animation tools
 
-Two-step pipeline for getting third-party 20×20 pixel animations onto the device.
+Pipeline for getting DeskPet MP4 animations onto the device.
 
-## 1. Scrape
-
-```bash
-node scrape_claudepix.js
-```
-
-Fetches the manifest from `claudepix.vercel.app/app.js`, then each animation's
-HTML file, evaluates the embedded JS in a Node VM context (loading the same
-`creature-engine.js` the site uses), and writes resolved frame data to
-`tools/claudepix_data/*.json`.
-
-Each output file looks like:
-```json
-{
-  "filename": "idle_breathe.html",
-  "name": "idle breathe",
-  "category": "Idle",
-  "description": "...",
-  "frame_count": 17,
-  "frames": [{ "hold": 500, "grid": [[0,0,...],[0,1,1,...],...] }, ...]
-}
-```
-
-Override URL or output dir with `--base` and `--out`.
-
-## 2. Convert to C
+## Generate
 
 ```bash
-node convert_to_c.js
+python3 generate_deskpet_animations.py
 ```
 
-Reads `tools/claudepix_data/*.json` and emits a single
-`firmware/src/splash_animations.h` with:
-- `splash_<ident>_frames[N][400]` — per-frame cell codes (0 = empty, 1 = body, 2 = eye)
-- `splash_<ident>_holds[N]` — per-frame hold time in ms
-- `splash_anims[]` — master table with name, category, frame count, pointers
-- `SPLASH_ANIM_COUNT`
+Reads all MP4 files in `logo/DeskPet-mp4/` and writes
+`firmware/src/deskpet_animations.h`.
 
-The firmware (`splash.cpp`) consumes this header to render and animate.
+Each animation is sampled into 320×320 frames, quantized to a per-animation
+64-color RGB565 palette, and RLE-encoded as `(run, palette_index)` byte pairs.
+The firmware decodes frames through `deskpet_anim.cpp`.
+
+The filename prefix controls ordering. For example, `01-idle.mp4` becomes
+`DESKPET_ANIM_IDLE`, and `08-low-battery.mp4` becomes
+`DESKPET_ANIM_LOW_BATTERY`.
+
+## Current Catalog
+
+- `01-idle.mp4`
+- `02-happy.mp4`
+- `03-sleepy.mp4`
+- `04-curious.mp4`
+- `05-angry.mp4`
+- `06-love.mp4`
+- `07-charging.mp4`
+- `08-low-battery.mp4`
+- `09-speaking.mp4`
+- `10-listening.mp4`
+- `11-transcribing.mp4`
 
 ## Re-running
 
-The scraper is idempotent — re-run any time the source library updates. The
-converter overwrites the header. Rebuild firmware after running both.
+The generator is idempotent. Re-run it after adding, deleting, or replacing MP4
+files, then rebuild firmware.
 
-## License note
+## Legacy
 
-The scraper hits a public site without a stated license. Confirm reuse is
-appropriate for your case before redistributing the output.
+Older claudepix scraper/converter scripts may exist in this directory for
+history, but the firmware animation path now uses `logo/DeskPet-mp4/` only.

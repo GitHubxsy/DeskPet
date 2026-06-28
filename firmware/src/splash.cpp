@@ -1,16 +1,11 @@
 #include "splash.h"
-#include "splash_animations.h"
+#include "deskpet_anim.h"
 #include "theme.h"
-#include "usage_rate.h"
 #include <Arduino.h>
-#include <string.h>
 #include <esp_heap_caps.h>
 
-// 20x20 grid scaled 24x to fill 480x480
-#define GRID         20
-#define CELL         24
-#define CANVAS_W     (GRID * CELL)
-#define CANVAS_H     (GRID * CELL)
+#define CANVAS_W     DESKPET_ANIM_W
+#define CANVAS_H     DESKPET_ANIM_H
 
 // Background fallback when palette is missing
 #define COL_EMPTY    0x0000  // true black (matches THEME_BG)
@@ -25,62 +20,25 @@ static uint16_t *canvas_buf = NULL;        // 480x480 RGB565 (PSRAM)
 static uint16_t cur_anim = 0;
 static uint16_t cur_frame = 0;
 static uint32_t frame_started_ms = 0;
-static uint32_t last_pick_ms = 0;
+static uint32_t anim_started_ms = 0;
 static bool active = false;
 
-// While splash is showing, auto-cycle to the next animation in the current
-// rate-driven group every this many ms.
-#define SPLASH_ROTATE_INTERVAL_MS 20000
-
-// Usage-rate animation groups: 4 groups × up to 4 animations each.
-// Filled at init by matching literal names from splash_anims[].
-#define GROUP_COUNT 4
-#define GROUP_MAX   4
-static int8_t  group_lists[GROUP_COUNT][GROUP_MAX];
-static uint8_t group_size[GROUP_COUNT] = {0};
-static uint8_t group_rotation[GROUP_COUNT] = {0};
-
-static const char* GROUP_NAMES[GROUP_COUNT][GROUP_MAX] = {
-    // Group 0 — idle / sleepy
-    { "expression sleep", "idle breathe", "idle blink", "expression wink" },
-    // Group 1 — normal pace
-    { "idle look around", "work think", "work coding", NULL },
-    // Group 2 — active
-    { "dance sway", "expression surprise", "dance bounce", NULL },
-    // Group 3 — heavy
-    { "dance bounce dj", "dance sway dj", "dance djmix", NULL },
+// Opening page loops through the six core DeskPet moods, independent of usage
+// rate, battery, voice state, or lamp state.
+static const uint8_t SPLASH_LOOP[] = {
+    DESKPET_ANIM_IDLE,
+    DESKPET_ANIM_HAPPY,
+    DESKPET_ANIM_SLEEPY,
+    DESKPET_ANIM_CURIOUS,
+    DESKPET_ANIM_ANGRY,
+    DESKPET_ANIM_LOVE,
 };
+#define SPLASH_LOOP_COUNT (sizeof(SPLASH_LOOP) / sizeof(SPLASH_LOOP[0]))
+#define SPLASH_ANIM_DURATION_MS 3000
+static uint8_t splash_loop_idx = 0;
 
-static void resolve_group_lists(void) {
-    for (int g = 0; g < GROUP_COUNT; g++) {
-        group_size[g] = 0;
-        for (int s = 0; s < GROUP_MAX; s++) {
-            group_lists[g][s] = -1;
-            const char* want = GROUP_NAMES[g][s];
-            if (!want) continue;
-            for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
-                if (strcmp(splash_anims[i].name, want) == 0) {
-                    group_lists[g][group_size[g]++] = (int8_t)i;
-                    break;
-                }
-            }
-        }
-    }
-}
-
-static void render_frame(const uint8_t *cells, const uint16_t *palette) {
-    for (int gy = 0; gy < GRID; gy++) {
-        uint16_t row[CANVAS_W];
-        for (int gx = 0; gx < GRID; gx++) {
-            uint8_t code = cells[gy * GRID + gx];
-            uint16_t color = (palette && code < SPLASH_PALETTE_SIZE) ? palette[code] : COL_EMPTY;
-            uint16_t *p = &row[gx * CELL];
-            for (int i = 0; i < CELL; i++) p[i] = color;
-        }
-        for (int dy = 0; dy < CELL; dy++) {
-            memcpy(&canvas_buf[(gy * CELL + dy) * CANVAS_W], row, CANVAS_W * 2);
-        }
-    }
+static void render_frame(int anim_idx, int frame_idx) {
+    deskpet_render_frame(anim_idx, frame_idx, canvas_buf, CANVAS_W, CANVAS_H);
     if (canvas) lv_obj_invalidate(canvas);
 }
 
@@ -115,79 +73,67 @@ void splash_init(lv_obj_t *parent) {
     label_status = lv_label_create(splash_container);
     lv_label_set_text(label_status,
         "no animations loaded\n\n"
-        "run tools/scrape_claudepix.js\n"
-        "then tools/convert_to_c.js");
+        "run tools/generate_deskpet_animations.py");
     lv_obj_set_style_text_font(label_status, &font_styrene_28, 0);
     lv_obj_set_style_text_color(label_status, lv_color_hex(0xb0aea5), 0);
     lv_obj_set_style_text_align(label_status, LV_TEXT_ALIGN_CENTER, 0);
     lv_obj_center(label_status);
 
-    resolve_group_lists();
-
-    if (SPLASH_ANIM_COUNT == 0) {
+    if (DESKPET_ANIM_COUNT == 0) {
         show_placeholder();
     } else {
         lv_obj_add_flag(label_status, LV_OBJ_FLAG_HIDDEN);
-        const splash_anim_def_t *a = &splash_anims[0];
-        render_frame(a->frames[0], a->palette);
+        cur_anim = SPLASH_LOOP[0];
+        render_frame(cur_anim, 0);
         frame_started_ms = millis();
+        anim_started_ms = frame_started_ms;
     }
 
     lv_obj_add_flag(splash_container, LV_OBJ_FLAG_HIDDEN);
 }
 
 void splash_tick(void) {
-    if (!active || SPLASH_ANIM_COUNT == 0) return;
+    if (!active || DESKPET_ANIM_COUNT == 0) return;
 
-    // Auto-rotate to the next animation in the current group.
-    if (millis() - last_pick_ms >= SPLASH_ROTATE_INTERVAL_MS) {
-        splash_pick_for_current_rate();
+    if (millis() - anim_started_ms >= SPLASH_ANIM_DURATION_MS) {
+        splash_next();
+        return;
     }
 
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    if (a->frame_count == 0) return;
+    int nframes = deskpet_anim_frames(cur_anim);
+    if (nframes == 0) return;
 
-    uint16_t hold = a->holds[cur_frame];
+    uint16_t hold = deskpet_frame_hold(cur_anim, cur_frame);
     if (millis() - frame_started_ms >= hold) {
-        cur_frame = (cur_frame + 1) % a->frame_count;
+        cur_frame = (cur_frame + 1) % nframes;
         frame_started_ms = millis();
-        render_frame(a->frames[cur_frame], a->palette);
+        render_frame(cur_anim, cur_frame);
     }
 }
 
 void splash_next(void) {
-    if (SPLASH_ANIM_COUNT == 0) return;
-    cur_anim = (cur_anim + 1) % SPLASH_ANIM_COUNT;
+    if (DESKPET_ANIM_COUNT == 0) return;
+    splash_loop_idx = (splash_loop_idx + 1) % SPLASH_LOOP_COUNT;
+    cur_anim = SPLASH_LOOP[splash_loop_idx];
     cur_frame = 0;
     frame_started_ms = millis();
-    last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    render_frame(a->frames[0], a->palette);
-    Serial.printf("splash: -> %s\n", a->name);
+    anim_started_ms = frame_started_ms;
+    render_frame(cur_anim, 0);
+    Serial.printf("splash: -> %s\n", deskpet_anim_name(cur_anim));
 }
 
 void splash_pick_for_current_rate(void) {
-    if (SPLASH_ANIM_COUNT == 0) return;
-    int g = usage_rate_group();
-    if (g < 0 || g >= GROUP_COUNT) g = 0;
-    if (group_size[g] == 0) return;
-
-    uint8_t slot = group_rotation[g] % group_size[g];
-    group_rotation[g]++;
-    int8_t idx = group_lists[g][slot];
-    if (idx < 0) return;
-
-    cur_anim = (uint16_t)idx;
+    if (DESKPET_ANIM_COUNT == 0) return;
     cur_frame = 0;
     frame_started_ms = millis();
-    last_pick_ms = frame_started_ms;
-    const splash_anim_def_t *a = &splash_anims[cur_anim];
-    render_frame(a->frames[0], a->palette);
+    anim_started_ms = frame_started_ms;
+    render_frame(cur_anim, 0);
 }
 
 bool splash_is_active(void) { return active; }
 
 void splash_show(void) {
+    cur_anim = SPLASH_LOOP[splash_loop_idx];
     splash_pick_for_current_rate();
     if (splash_container) lv_obj_clear_flag(splash_container, LV_OBJ_FLAG_HIDDEN);
     active = true;
@@ -203,38 +149,18 @@ lv_obj_t* splash_get_root(void) {
 }
 
 int splash_find_anim(const char* name) {
-    for (int i = 0; i < SPLASH_ANIM_COUNT; i++) {
-        if (strcmp(splash_anims[i].name, name) == 0) return i;
-    }
-    return -1;
+    return deskpet_find_anim(name);
 }
 
 int splash_anim_frames(int anim_idx) {
-    if (anim_idx < 0 || anim_idx >= SPLASH_ANIM_COUNT) return 0;
-    return splash_anims[anim_idx].frame_count;
+    return deskpet_anim_frames(anim_idx);
 }
 
 uint16_t splash_frame_hold(int anim_idx, int frame_idx) {
-    if (anim_idx < 0 || anim_idx >= SPLASH_ANIM_COUNT) return 0;
-    const splash_anim_def_t* a = &splash_anims[anim_idx];
-    if (frame_idx < 0 || frame_idx >= a->frame_count) return 0;
-    return a->holds[frame_idx];
+    return deskpet_frame_hold(anim_idx, frame_idx);
 }
 
 void splash_render_scaled(int anim_idx, int frame_idx, uint16_t* buf, int cell_size) {
-    if (anim_idx < 0 || anim_idx >= SPLASH_ANIM_COUNT) return;
-    const splash_anim_def_t* a = &splash_anims[anim_idx];
-    if (frame_idx < 0 || frame_idx >= a->frame_count) return;
-    const uint8_t* cells = a->frames[frame_idx];
-    const uint16_t* pal = a->palette;
-    int w = GRID * cell_size;
-    for (int gy = 0; gy < GRID; gy++) {
-        uint16_t* first = &buf[gy * cell_size * w];
-        for (int gx = 0; gx < GRID; gx++) {
-            uint8_t code = cells[gy * GRID + gx];
-            uint16_t color = (pal && code < SPLASH_PALETTE_SIZE) ? pal[code] : 0x0000;
-            for (int dx = 0; dx < cell_size; dx++) first[gx * cell_size + dx] = color;
-        }
-        for (int dy = 1; dy < cell_size; dy++) memcpy(first + dy * w, first, w * 2);
-    }
+    int w = 20 * cell_size;
+    deskpet_render_frame(anim_idx, frame_idx, buf, w, w);
 }

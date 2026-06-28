@@ -29,6 +29,13 @@
 // ---- PMU (AXP2101 via same I2C) ----
 #define AXP2101_ADDR 0x34
 
+// ---- On-board ES7210 microphone ADC ----
+#define ES7210_ADDR  0x40
+#define MIC_I2S_BCLK 9
+#define MIC_I2S_LRCK 45
+#define MIC_I2S_DIN  10
+#define MIC_I2S_MCLK 42
+
 // ---- Global hardware objects (defined in main.cpp) ----
 extern Arduino_DataBus *bus;
 extern Arduino_CO5300 *gfx;

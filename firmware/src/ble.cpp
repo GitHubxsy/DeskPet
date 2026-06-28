@@ -2,6 +2,7 @@
 #include <Arduino.h>
 #include <NimBLEDevice.h>
 #include <NimBLEHIDDevice.h>
+#include <string.h>
 
 #define DEVICE_NAME "Clawdmeter"
 
@@ -13,6 +14,7 @@
 
 #define BLE_BUF_SIZE 512
 #define CHAT_BUF_SIZE 2048
+#define VOICE_CHUNK_PAYLOAD_MAX 176
 
 // HID keyboard report descriptor
 static const uint8_t HID_REPORT_MAP[] = {
@@ -62,6 +64,7 @@ static volatile size_t chat_len = 0;
 static volatile bool chat_updated = false;
 static volatile bool chat_complete = false;
 static volatile bool chat_error = false;
+static volatile bool chat_speech_done = false;
 
 static void start_advertising() {
     NimBLEAdvertising* adv = NimBLEDevice::getAdvertising();
@@ -98,7 +101,8 @@ class ServerCallbacks : public NimBLEServerCallbacks {
 
 // The RX characteristic carries two kinds of message, told apart by the
 // first byte: a usage payload is JSON (starts with '{'); chat traffic is
-// tagged 0x02 (text chunk), 0x04 (response complete), 0x15 (error).
+// tagged 0x02 (text chunk), 0x04 (response complete), 0x05 (speech done),
+// 0x15 (error).
 class RxCallbacks : public NimBLECharacteristicCallbacks {
     void onWrite(NimBLECharacteristic* chr, NimBLEConnInfo& info) override {
         std::string val = chr->getValue();
@@ -117,6 +121,11 @@ class RxCallbacks : public NimBLECharacteristicCallbacks {
         }
         if (tag == 0x04) {  // chat response complete
             chat_complete = true;
+            chat_updated = true;
+            return;
+        }
+        if (tag == 0x05) {  // spoken audio finished on the host
+            chat_speech_done = true;
             chat_updated = true;
             return;
         }
@@ -271,12 +280,94 @@ void ble_send_chat_request(uint8_t question_idx) {
     chat_updated = false;
     chat_complete = false;
     chat_error = false;
+    chat_speech_done = false;
     if (state == BLE_STATE_CONNECTED && req_char) {
         uint8_t v = 0x10 + question_idx;  // 0x10..0x1F reserved for chat
         req_char->setValue(&v, 1);
         req_char->notify();
         Serial.printf("BLE: chat request %u\n", question_idx);
     }
+}
+
+void ble_send_text_command(const char* text) {
+    chat_len = 0;
+    chat_buf[0] = '\0';
+    chat_updated = false;
+    chat_complete = false;
+    chat_error = false;
+    chat_speech_done = false;
+    if (state == BLE_STATE_CONNECTED && req_char && text) {
+        uint8_t payload[181];
+        size_t len = strnlen(text, sizeof(payload) - 1);
+        payload[0] = 0x40;
+        memcpy(payload + 1, text, len);
+        req_char->setValue(payload, len + 1);
+        req_char->notify();
+        Serial.printf("BLE: text command %.*s\n", (int)len, text);
+    }
+}
+
+void ble_chat_reset(void) {
+    chat_len = 0;
+    chat_buf[0] = '\0';
+    chat_updated = false;
+    chat_complete = false;
+    chat_error = false;
+    chat_speech_done = false;
+}
+
+bool ble_send_voice_start(uint16_t sample_rate, uint8_t channels) {
+    if (state != BLE_STATE_CONNECTED || !req_char) return false;
+    uint8_t v[4] = {
+        0x50,
+        (uint8_t)(sample_rate & 0xff),
+        (uint8_t)((sample_rate >> 8) & 0xff),
+        channels,
+    };
+    chat_len = 0;
+    chat_buf[0] = '\0';
+    chat_updated = false;
+    chat_complete = false;
+    chat_error = false;
+    chat_speech_done = false;
+    req_char->setValue(v, sizeof(v));
+    req_char->notify();
+    Serial.printf("BLE: voice start %uHz %uch\n", sample_rate, channels);
+    return true;
+}
+
+bool ble_send_voice_chunk(uint16_t seq, const uint8_t* data, size_t len) {
+    if (state != BLE_STATE_CONNECTED || !req_char || !data || len == 0) return false;
+    if (len > VOICE_CHUNK_PAYLOAD_MAX) len = VOICE_CHUNK_PAYLOAD_MAX;
+    uint8_t payload[3 + VOICE_CHUNK_PAYLOAD_MAX];
+    payload[0] = 0x51;
+    payload[1] = (uint8_t)(seq & 0xff);
+    payload[2] = (uint8_t)((seq >> 8) & 0xff);
+    memcpy(payload + 3, data, len);
+    req_char->setValue(payload, len + 3);
+    req_char->notify();
+    return true;
+}
+
+bool ble_send_voice_end(void) {
+    if (state != BLE_STATE_CONNECTED || !req_char) return false;
+    uint8_t v = 0x52;
+    req_char->setValue(&v, 1);
+    req_char->notify();
+    Serial.println("BLE: voice end");
+    return true;
+}
+
+bool ble_send_voice_abort(const char* reason) {
+    if (state != BLE_STATE_CONNECTED || !req_char) return false;
+    uint8_t payload[96];
+    payload[0] = 0x53;
+    size_t len = reason ? strnlen(reason, sizeof(payload) - 1) : 0;
+    if (len) memcpy(payload + 1, reason, len);
+    req_char->setValue(payload, len + 1);
+    req_char->notify();
+    Serial.printf("BLE: voice abort %.*s\n", (int)len, reason ? reason : "");
+    return true;
 }
 
 bool ble_chat_has_update(void) {
@@ -295,6 +386,12 @@ bool ble_chat_is_complete(void) {
 
 bool ble_chat_has_error(void) {
     return chat_error;
+}
+
+bool ble_chat_speech_done(void) {
+    if (!chat_speech_done) return false;
+    chat_speech_done = false;
+    return true;
 }
 
 void ble_send_open_app(void) {

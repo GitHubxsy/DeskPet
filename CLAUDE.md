@@ -10,24 +10,27 @@ This file is for future Claude Code sessions to bootstrap quickly. Read this fir
 - Touch: **CST9220** via I2C (SDA=15, SCL=14, INT=11, addr=0x5A)
 - PMU: **AXP2101** on same I2C bus (addr=0x34) — battery, USB VBUS, PWR button IRQ
 - IMU: **QMI8658** on same I2C bus (addr=0x6B) — accelerometer for auto-rotation
-- Buttons: GPIO 0 (left → Space/voice-mode), GPIO 18 (right → Shift+Tab/mode-toggle), AXP PKEY (middle → cycle screens; on splash → cycle animations)
+- Mic ADC: **ES7210** on same I2C bus (addr=0x40), I2S (BCLK=9, LRCK=45, DIN=10, MCLK=16)
+- Buttons: GPIO 0 (left → enter/hold Chat voice), GPIO 18 (right → Shift+Tab/mode-toggle), AXP PKEY (middle → cycle screens; Chat exits to Splash)
 
 ## Architecture
 
 ```text
-main.cpp        — setup(), loop(), button polling (left→Space, right→Shift+Tab, mid→cycle), rotation flash
+main.cpp        — setup(), loop(), button polling (left→Chat voice, right→Shift+Tab, mid→cycle), rotation flash
 display_cfg.h   — pin defines, extern object decls
-ui.{h,cpp}      — 3-screen UI (splash, usage, bluetooth); splash is touch-toggled, usage↔bluetooth via mid button
-splash.{h,cpp}  — 20×20 pixel-art animation engine, 24× upscale to 480×480
+ui.{h,cpp}      — multi-screen UI; Chat is the main DeskPet voice screen
+splash.{h,cpp}  — DeskPet MP4 animation screen using compressed indexed frames
+deskpet_anim.{h,cpp} — DeskPet animation decoder/player
 imu.{h,cpp}     — accelerometer-driven rotation tracker (returns 0..3)
 power.{h,cpp}   — AXP2101 wrapper (battery %, charging, VBUS, PWR button)
 touch.{h,cpp}   — minimal tap detector → ui_toggle_splash() (Usage/Splash) or ble_clear_bonds() (BT reset zone)
 ble.{h,cpp}     — NimBLE peripheral: custom data service + HID keyboard
+voice.{h,cpp}   — ES7210 + I2S PCM capture; Ask-page left button streams audio over BLE
 data.h          — UsageData struct
 icons.h         — icon arrays. Battery (5×) are RGB565A8 with alpha; rest are raw RGB565.
 logo.h          — 80×80 RGB565 logo
 font_*.c        — pre-compiled LVGL 9 bitmap fonts (Tiempos 56, Styrene 48/28/24/20, Mono 32)
-splash_animations.h — generated, do not hand-edit
+deskpet_animations.h — generated from logo/DeskPet-mp4/*.mp4, do not hand-edit
 ```
 
 ## Build / flash
@@ -62,17 +65,32 @@ The boot screen is `SCREEN_SPLASH` and only advances on a physical button press,
 
 `tools/png_to_lvgl.js <input.png> <symbol> [W_MACRO] [H_MACRO] [--tint=RRGGBB | --no-tint]` converts an alpha PNG to RGB565A8. Default tint is white (`0xFFFFFF`) — necessary for Lucide PNGs. Splice output into `firmware/src/icons.h` and use `init_icon_dsc_rgb565a8()` in ui.cpp. Currently only the 5 battery icons use this format; the rest are still raw RGB565 baked over the panel background, fine because they live inside opaque zones.
 
-## Splash animations
+## DeskPet animations
 
-13 × 20×20 pixel-art creature animations sourced from
-[claudepix.vercel.app](https://claudepix.vercel.app). Pipeline:
+DeskPet animations are sourced from MP4 files under `logo/DeskPet-mp4/`.
+The current catalog is:
+
+- `01-idle.mp4`
+- `02-happy.mp4`
+- `03-sleepy.mp4`
+- `04-curious.mp4`
+- `05-angry.mp4`
+- `06-love.mp4`
+- `07-charging.mp4`
+- `08-low-battery.mp4`
+- `09-speaking.mp4`
+- `10-listening.mp4`
+- `11-transcribing.mp4`
+
+Pipeline:
 
 ```bash
-node tools/scrape_claudepix.js  # → tools/claudepix_data/*.json
-node tools/convert_to_c.js      # → firmware/src/splash_animations.h
+python3 tools/generate_deskpet_animations.py  # → firmware/src/deskpet_animations.h
 ```
 
-Each animation has a per-animation 10-color RGB565 palette. Cell values 0..9 index it. Default boot screen.
+The generator samples each MP4 into 320×320 frames, quantizes each animation
+to a 64-color RGB565 palette, and RLE-encodes indexed pixels as `(run, index)`
+byte pairs. `deskpet_anim.cpp` decodes frames into PSRAM canvas buffers.
 
 ## User profile / preferences
 
@@ -104,3 +122,4 @@ Bash daemon (`daemon/claude-usage-daemon.sh`) reads OAuth token, polls Anthropic
 - `...0002` RX — daemon writes JSON usage payload here.
 - `...0003` TX — firmware notifies ack/nack (daemon doesn't subscribe).
 - `...0004` REQ — firmware fires `0x01` notify in `onSubscribe` if `has_received_data` is false. Daemon subscribes via `setsid bash -c "stdbuf -oL dbus-monitor … | awk …"`; awk drops a flag file the inner loop picks up. See the `feedback_dbus_monitor_pipe` memory for the three subtle gotchas (pipe buffering, busctl-exits race, `wait` blocking on pipeline jobs).
+- Voice commands use the same REQ notify characteristic: `0x50` start (`sample_rate`, `channels`), `0x51` PCM16 chunks, `0x52` end, `0x53` abort. The daemon wraps PCM as WAV, transcribes with `voice_control.py`, then passes the transcript through the existing natural-language lamp control path. Runtime copies still live under `~/.clawdmeter-daemon`.

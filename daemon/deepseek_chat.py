@@ -13,6 +13,8 @@ Standalone test:
     python3 deepseek_chat.py "你好，介绍一下自己"
 """
 
+from __future__ import annotations
+
 import json
 import os
 

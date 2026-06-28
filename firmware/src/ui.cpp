@@ -5,6 +5,7 @@
 #include <esp_heap_caps.h>
 #include <string.h>
 #include "logo.h"
+#include "deskpet_anim.h"
 #include "icons.h"
 #include "display_cfg.h"
 #include "usage_rate.h"
@@ -82,10 +83,18 @@ static int      clock_last_shown = -1;
 
 // ---- Chat screen widgets ----
 static lv_obj_t* chat_container;
-static lv_obj_t* chat_list;          // holds the preset question rows
+static lv_obj_t* chat_list;          // idle conversation scene
+static lv_obj_t* chat_hero_canvas;
 static lv_obj_t* chat_status;        // "Thinking..." label
 static lv_obj_t* chat_answer_box;    // scrollable answer container
 static lv_obj_t* chat_answer_label;
+static lv_obj_t* chat_idle_bubble_label;
+static uint16_t* chat_hero_buf = nullptr;
+static int chat_anim_id = DESKPET_ANIM_IDLE;
+static uint8_t chat_anim_frame = 0;
+static uint32_t chat_anim_frame_ms = 0;
+static int ui_battery_percent = -1;
+static bool ui_battery_charging = false;
 
 enum chat_state_t { CHAT_STATE_LIST, CHAT_STATE_WAITING, CHAT_STATE_ANSWER };
 static chat_state_t chat_state = CHAT_STATE_LIST;
@@ -97,8 +106,13 @@ static const char* const chat_questions[] = {
     "Tell me a short joke",
     "Explain recursion simply",
     "What can you do?",
+    "Lamp soft green",
+    "Lamp warm white 60%",
+    "Lamp focus",
+    "Lamp off",
 };
-#define CHAT_QUESTION_COUNT 4
+#define CHAT_QUESTION_COUNT ((int)(sizeof(chat_questions) / sizeof(chat_questions[0])))
+#define CHAT_VOICE_DEMO_TEXT "Lamp soft green"
 
 // ---- Light screen widgets ----
 static lv_obj_t* light_container;
@@ -138,7 +152,7 @@ static uint8_t light_color_idx = 5;
 static bool quota_limited_seen = false;
 static int clawd_light_sent_group = -1;
 
-// ---- Nudge overlay (idle reminder — finger + Claude animation, on top of everything) ----
+// ---- Nudge overlay (idle reminder — finger + DeskPet animation, on top of everything) ----
 static lv_obj_t* nudge_overlay = nullptr;
 static lv_obj_t* nudge_anim_canvas = nullptr;
 static lv_obj_t* nudge_finger_canvas = nullptr;
@@ -153,7 +167,7 @@ static uint16_t  nudge_cur_hold = 200;
 #define NUDGE_ANIM_W (20 * NUDGE_CELL)  // 240
 #define NUDGE_ANIM_H (20 * NUDGE_CELL)  // 240
 
-// Classic cursor hand rotated 90° CW — pointing RIGHT toward the Claude animation
+// Classic cursor hand rotated 90° CW — pointing RIGHT toward DeskPet
 #define FINGER_GW    16
 #define FINGER_GH    11
 #define FINGER_CELL  10
@@ -336,6 +350,15 @@ static void init_icon_dsc_rgb565a8(lv_image_dsc_t* dsc, int w, int h, const uint
     dsc->header.stride = w * 2;
     dsc->data = data;
     dsc->data_size = w * h * 3;
+}
+
+static void init_image_dsc_rgb565(lv_image_dsc_t* dsc, int w, int h, const uint8_t* data) {
+    dsc->header.w = w;
+    dsc->header.h = h;
+    dsc->header.cf = LV_COLOR_FORMAT_RGB565;
+    dsc->header.stride = w * 2;
+    dsc->data = data;
+    dsc->data_size = w * h * 2;
 }
 
 static lv_obj_t* make_pill(lv_obj_t* parent, const char* text) {
@@ -543,6 +566,28 @@ static void chat_show_only(lv_obj_t* obj, chat_state_t for_state, chat_state_t c
     else                  lv_obj_add_flag(obj, LV_OBJ_FLAG_HIDDEN);
 }
 
+static void chat_render_anim_frame(void) {
+    if (!chat_hero_buf) return;
+    deskpet_render_frame(chat_anim_id, chat_anim_frame,
+                         chat_hero_buf, DESKPET_ANIM_W, DESKPET_ANIM_H);
+    if (chat_hero_canvas) lv_obj_invalidate(chat_hero_canvas);
+}
+
+static void chat_set_anim(int anim_id) {
+    if (anim_id < 0 || anim_id >= DESKPET_ANIM_COUNT) anim_id = DESKPET_ANIM_IDLE;
+    if (chat_anim_id == anim_id && chat_anim_frame == 0) return;
+    chat_anim_id = anim_id;
+    chat_anim_frame = 0;
+    chat_anim_frame_ms = lv_tick_get();
+    chat_render_anim_frame();
+}
+
+static int chat_idle_anim_for_power(void) {
+    if (ui_battery_charging) return DESKPET_ANIM_CHARGING;
+    if (ui_battery_percent >= 0 && ui_battery_percent <= 20) return DESKPET_ANIM_LOW_BATTERY;
+    return DESKPET_ANIM_IDLE;
+}
+
 static void chat_set_state(chat_state_t s) {
     chat_state = s;
     chat_show_only(chat_list,       CHAT_STATE_LIST,    s);
@@ -550,13 +595,125 @@ static void chat_set_state(chat_state_t s) {
     chat_show_only(chat_answer_box, CHAT_STATE_ANSWER,  s);
     if (s == CHAT_STATE_ANSWER && chat_answer_box)
         lv_obj_scroll_to_y(chat_answer_box, 0, LV_ANIM_OFF);
+    if (s == CHAT_STATE_LIST) {
+        if (chat_idle_bubble_label) lv_label_set_text(chat_idle_bubble_label, "Hold left to talk.");
+        chat_set_anim(chat_idle_anim_for_power());
+    }
+}
+
+static lv_obj_t* chat_make_dot(lv_obj_t* parent, int x, int y, int size, lv_color_t color) {
+    lv_obj_t* dot = lv_obj_create(parent);
+    lv_obj_set_pos(dot, x, y);
+    lv_obj_set_size(dot, size, size);
+    lv_obj_set_style_bg_color(dot, color, 0);
+    lv_obj_set_style_bg_opa(dot, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(dot, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(dot, 0, 0);
+    lv_obj_clear_flag(dot, LV_OBJ_FLAG_SCROLLABLE);
+    return dot;
+}
+
+static void chat_make_avatar(lv_obj_t* parent, int x, int y) {
+    lv_obj_t* shadow = lv_obj_create(parent);
+    lv_obj_set_pos(shadow, x + 12, y + 14);
+    lv_obj_set_size(shadow, 240, 156);
+    lv_obj_set_style_bg_color(shadow, COL_BAR_BG, 0);
+    lv_obj_set_style_bg_opa(shadow, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(shadow, 8, 0);
+    lv_obj_set_style_border_width(shadow, 0, 0);
+    lv_obj_clear_flag(shadow, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* body = lv_obj_create(parent);
+    lv_obj_set_pos(body, x, y);
+    lv_obj_set_size(body, 240, 156);
+    lv_obj_set_style_bg_color(body, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(body, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(body, 8, 0);
+    lv_obj_set_style_border_width(body, 2, 0);
+    lv_obj_set_style_border_color(body, COL_ACCENT, 0);
+    lv_obj_clear_flag(body, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* name = lv_label_create(body);
+    lv_label_set_text(name, "DeskPet");
+    lv_obj_set_style_text_font(name, &font_styrene_28, 0);
+    lv_obj_set_style_text_color(name, COL_TEXT, 0);
+    lv_obj_align(name, LV_ALIGN_TOP_MID, 0, 18);
+
+    chat_make_dot(body, 22, 22, 12, COL_GREEN);
+    chat_make_dot(body, 206, 22, 12, COL_AMBER);
+
+    lv_obj_t* left_eye = lv_obj_create(body);
+    lv_obj_set_pos(left_eye, 58, 78);
+    lv_obj_set_size(left_eye, 42, 10);
+    lv_obj_set_style_bg_color(left_eye, COL_TEXT, 0);
+    lv_obj_set_style_bg_opa(left_eye, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(left_eye, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(left_eye, 0, 0);
+    lv_obj_clear_flag(left_eye, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t* right_eye = lv_obj_create(body);
+    lv_obj_set_pos(right_eye, 140, 78);
+    lv_obj_set_size(right_eye, 42, 10);
+    lv_obj_set_style_bg_color(right_eye, COL_TEXT, 0);
+    lv_obj_set_style_bg_opa(right_eye, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(right_eye, LV_RADIUS_CIRCLE, 0);
+    lv_obj_set_style_border_width(right_eye, 0, 0);
+    lv_obj_clear_flag(right_eye, LV_OBJ_FLAG_SCROLLABLE);
+
+    for (int i = 0; i < 5; i++) {
+        static const int heights[] = {12, 24, 36, 24, 12};
+        lv_obj_t* bar = lv_obj_create(body);
+        lv_obj_set_pos(bar, 82 + i * 18, 122 - heights[i]);
+        lv_obj_set_size(bar, 8, heights[i]);
+        lv_obj_set_style_bg_color(bar, COL_GREEN, 0);
+        lv_obj_set_style_bg_opa(bar, LV_OPA_COVER, 0);
+        lv_obj_set_style_radius(bar, LV_RADIUS_CIRCLE, 0);
+        lv_obj_set_style_border_width(bar, 0, 0);
+        lv_obj_clear_flag(bar, LV_OBJ_FLAG_SCROLLABLE);
+    }
 }
 
 static void chat_question_click_cb(lv_event_t* e) {
     intptr_t idx = (intptr_t)lv_event_get_user_data(e);
     lv_label_set_text(chat_answer_label, "");
     ble_send_chat_request((uint8_t)idx);
+    chat_set_anim(DESKPET_ANIM_CURIOUS);
     chat_set_state(CHAT_STATE_WAITING);
+}
+
+void ui_chat_voice_press(void) {
+    if (current_screen != SCREEN_CHAT) return;
+    lv_label_set_text(chat_answer_label, "");
+    lv_label_set_text(chat_status, "Listening...");
+    chat_set_anim(DESKPET_ANIM_LISTENING);
+    chat_set_state(CHAT_STATE_WAITING);
+}
+
+void ui_chat_voice_release(bool real_audio) {
+    if (current_screen != SCREEN_CHAT) return;
+    if (ble_get_state() != BLE_STATE_CONNECTED) {
+        lv_label_set_text(chat_answer_label, "BLE offline");
+        chat_set_anim(DESKPET_ANIM_ANGRY);
+        chat_set_state(CHAT_STATE_ANSWER);
+        return;
+    }
+    if (real_audio) {
+        lv_label_set_text(chat_status, "Transcribing...");
+        chat_set_anim(DESKPET_ANIM_TRANSCRIBING);
+        chat_set_state(CHAT_STATE_WAITING);
+        return;
+    }
+    lv_label_set_text(chat_status, "Heard: " CHAT_VOICE_DEMO_TEXT);
+    ble_send_text_command(CHAT_VOICE_DEMO_TEXT);
+    chat_set_anim(DESKPET_ANIM_TRANSCRIBING);
+    chat_set_state(CHAT_STATE_WAITING);
+}
+
+void ui_chat_debug_set_anim(int anim_id) {
+    if (anim_id < 0 || anim_id >= DESKPET_ANIM_COUNT) return;
+    if (current_screen != SCREEN_CHAT) ui_show_screen(SCREEN_CHAT);
+    chat_set_state(CHAT_STATE_LIST);
+    chat_set_anim(anim_id);
 }
 
 // Tap the answer to go back to the question list.
@@ -575,60 +732,73 @@ static void init_chat_screen(lv_obj_t* scr) {
     lv_obj_clear_flag(chat_container, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_add_event_cb(chat_container, chat_screen_click_cb, LV_EVENT_CLICKED, NULL);
 
-    lv_obj_t* title = lv_label_create(chat_container);
-    lv_label_set_text(title, "Ask");
-    lv_obj_set_style_text_font(title, &font_tiempos_56, 0);
-    lv_obj_set_style_text_color(title, COL_TEXT, 0);
-    lv_obj_align(title, LV_ALIGN_TOP_MID, 16, TITLE_Y);
+    // Idle conversation scene.
+    chat_hero_buf = (uint16_t*)heap_caps_malloc(DESKPET_ANIM_W * DESKPET_ANIM_H * 2, MALLOC_CAP_SPIRAM);
+    if (chat_hero_buf) {
+        chat_hero_canvas = lv_canvas_create(chat_container);
+        lv_canvas_set_buffer(chat_hero_canvas, chat_hero_buf,
+                             DESKPET_ANIM_W, DESKPET_ANIM_H, LV_COLOR_FORMAT_RGB565);
+        lv_obj_set_pos(chat_hero_canvas, (SCR_W - DESKPET_ANIM_W) / 2, 44);
+        chat_render_anim_frame();
+    } else {
+        chat_hero_canvas = nullptr;
+        Serial.println("chat: failed to alloc DeskPet canvas buffer");
+    }
 
-    // Question list — a column of tappable rows.
     chat_list = lv_obj_create(chat_container);
-    lv_obj_set_size(chat_list, CONTENT_W, 372);
-    lv_obj_set_pos(chat_list, MARGIN, CONTENT_Y);
+    lv_obj_set_size(chat_list, CONTENT_W, 92);
+    lv_obj_set_pos(chat_list, MARGIN, 370);
     lv_obj_set_style_bg_opa(chat_list, LV_OPA_TRANSP, 0);
     lv_obj_set_style_border_width(chat_list, 0, 0);
     lv_obj_set_style_pad_all(chat_list, 0, 0);
-    lv_obj_set_style_pad_row(chat_list, 14, 0);
-    lv_obj_set_flex_flow(chat_list, LV_FLEX_FLOW_COLUMN);
     lv_obj_clear_flag(chat_list, LV_OBJ_FLAG_SCROLLABLE);
 
-    for (int i = 0; i < CHAT_QUESTION_COUNT; i++) {
-        lv_obj_t* row = lv_obj_create(chat_list);
-        lv_obj_set_size(row, LV_PCT(100), 82);
-        lv_obj_set_style_bg_color(row, COL_PANEL, 0);
-        lv_obj_set_style_bg_opa(row, LV_OPA_COVER, 0);
-        lv_obj_set_style_radius(row, 8, 0);
-        lv_obj_set_style_border_width(row, 0, 0);
-        lv_obj_set_style_pad_all(row, 14, 0);
-        lv_obj_clear_flag(row, LV_OBJ_FLAG_SCROLLABLE);
-        lv_obj_add_event_cb(row, chat_question_click_cb, LV_EVENT_CLICKED,
-                            (void*)(intptr_t)i);
+    lv_obj_t* bubble = lv_obj_create(chat_list);
+    lv_obj_set_pos(bubble, 48, 0);
+    lv_obj_set_size(bubble, 344, 72);
+    lv_obj_set_style_bg_color(bubble, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(bubble, LV_OPA_90, 0);
+    lv_obj_set_style_radius(bubble, 8, 0);
+    lv_obj_set_style_border_width(bubble, 2, 0);
+    lv_obj_set_style_border_color(bubble, COL_BAR_BG, 0);
+    lv_obj_set_style_pad_left(bubble, 18, 0);
+    lv_obj_set_style_pad_right(bubble, 18, 0);
+    lv_obj_set_style_pad_top(bubble, 12, 0);
+    lv_obj_set_style_pad_bottom(bubble, 12, 0);
+    lv_obj_clear_flag(bubble, LV_OBJ_FLAG_SCROLLABLE);
 
-        lv_obj_t* q = lv_label_create(row);
-        lv_label_set_text(q, chat_questions[i]);
-        lv_obj_set_style_text_font(q, &font_styrene_24, 0);
-        lv_obj_set_style_text_color(q, COL_TEXT, 0);
-        lv_obj_set_width(q, LV_PCT(100));
-        lv_label_set_long_mode(q, LV_LABEL_LONG_WRAP);
-        lv_obj_center(q);
-    }
+    chat_idle_bubble_label = lv_label_create(bubble);
+    lv_label_set_text(chat_idle_bubble_label, "Hold left to talk.");
+    lv_obj_set_style_text_font(chat_idle_bubble_label, &font_styrene_24, 0);
+    lv_obj_set_style_text_color(chat_idle_bubble_label, COL_TEXT, 0);
+    lv_obj_set_width(chat_idle_bubble_label, LV_PCT(100));
+    lv_label_set_long_mode(chat_idle_bubble_label, LV_LABEL_LONG_WRAP);
+    lv_obj_center(chat_idle_bubble_label);
 
     // "Thinking..." status
     chat_status = lv_label_create(chat_container);
     lv_label_set_text(chat_status, "Thinking\xE2\x80\xA6");
     lv_obj_set_style_text_font(chat_status, &font_styrene_28, 0);
-    lv_obj_set_style_text_color(chat_status, COL_DIM, 0);
-    lv_obj_align(chat_status, LV_ALIGN_CENTER, 0, 0);
+    lv_obj_set_style_text_color(chat_status, COL_TEXT, 0);
+    lv_obj_set_style_bg_color(chat_status, COL_PANEL, 0);
+    lv_obj_set_style_bg_opa(chat_status, LV_OPA_COVER, 0);
+    lv_obj_set_style_radius(chat_status, 8, 0);
+    lv_obj_set_style_pad_left(chat_status, 22, 0);
+    lv_obj_set_style_pad_right(chat_status, 22, 0);
+    lv_obj_set_style_pad_top(chat_status, 14, 0);
+    lv_obj_set_style_pad_bottom(chat_status, 14, 0);
+    lv_obj_align(chat_status, LV_ALIGN_BOTTOM_MID, 0, -36);
     lv_obj_add_flag(chat_status, LV_OBJ_FLAG_HIDDEN);
 
     // Answer box — scrollable for long replies.
     chat_answer_box = lv_obj_create(chat_container);
-    lv_obj_set_size(chat_answer_box, CONTENT_W, 372);
-    lv_obj_set_pos(chat_answer_box, MARGIN, CONTENT_Y);
+    lv_obj_set_size(chat_answer_box, 384, 92);
+    lv_obj_set_pos(chat_answer_box, 48, 370);
     lv_obj_set_style_bg_color(chat_answer_box, COL_PANEL, 0);
     lv_obj_set_style_bg_opa(chat_answer_box, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(chat_answer_box, 8, 0);
-    lv_obj_set_style_border_width(chat_answer_box, 0, 0);
+    lv_obj_set_style_border_width(chat_answer_box, 2, 0);
+    lv_obj_set_style_border_color(chat_answer_box, COL_BAR_BG, 0);
     lv_obj_set_style_pad_all(chat_answer_box, 16, 0);
     lv_obj_add_flag(chat_answer_box, LV_OBJ_FLAG_EVENT_BUBBLE);
     lv_obj_add_flag(chat_answer_box, LV_OBJ_FLAG_HIDDEN);
@@ -646,11 +816,28 @@ static void init_chat_screen(lv_obj_t* scr) {
 
 void ui_tick_chat(void) {
     if (current_screen != SCREEN_CHAT) return;
+    uint32_t now = lv_tick_get();
+    uint16_t hold = deskpet_frame_hold(chat_anim_id, chat_anim_frame);
+    if (hold == 0) hold = DESKPET_ANIM_DEFAULT_FRAME_MS;
+    if (now - chat_anim_frame_ms >= hold) {
+        int nframes = deskpet_anim_frames(chat_anim_id);
+        if (nframes <= 0) nframes = 1;
+        chat_anim_frame_ms = now;
+        chat_anim_frame = (chat_anim_frame + 1) % nframes;
+        chat_render_anim_frame();
+    }
     if (chat_state == CHAT_STATE_LIST) return;
     if (!ble_chat_has_update()) return;
 
+    if (ble_chat_speech_done()) {
+        lv_label_set_text(chat_answer_label, "");
+        chat_set_state(CHAT_STATE_LIST);
+        return;
+    }
+
     const char* txt = ble_chat_text();
     if (chat_state == CHAT_STATE_WAITING && (txt[0] != '\0' || ble_chat_is_complete())) {
+        chat_set_anim(ble_chat_has_error() ? DESKPET_ANIM_ANGRY : DESKPET_ANIM_SPEAKING);
         chat_set_state(CHAT_STATE_ANSWER);
     }
     if (chat_state == CHAT_STATE_ANSWER) {
@@ -927,7 +1114,7 @@ static void init_pomodoro_screen(lv_obj_t* scr) {
     lv_obj_add_flag(pomo_container, LV_OBJ_FLAG_HIDDEN);
 }
 
-// ======== Nudge overlay (finger → Claude animation, tap to open) ========
+// ======== Nudge overlay (finger → DeskPet animation, tap to open) ========
 
 static void render_finger(uint16_t* buf) {
     for (int gy = 0; gy < FINGER_GH; gy++) {
@@ -949,7 +1136,7 @@ static void nudge_click_cb(lv_event_t* e) {
 }
 
 static void init_nudge_overlay(lv_obj_t* scr) {
-    nudge_anim_idx = splash_find_anim("work coding");
+    nudge_anim_idx = splash_find_anim("curious");
 
     nudge_anim_buf = (uint16_t*)heap_caps_malloc(NUDGE_ANIM_W * NUDGE_ANIM_H * 2, MALLOC_CAP_SPIRAM);
     nudge_finger_buf = (uint16_t*)heap_caps_malloc(FINGER_PX_W * FINGER_PX_H * 2, MALLOC_CAP_SPIRAM);
@@ -974,7 +1161,7 @@ static void init_nudge_overlay(lv_obj_t* scr) {
                          FINGER_PX_W, FINGER_PX_H, LV_COLOR_FORMAT_RGB565);
     lv_obj_set_pos(nudge_finger_canvas, NUDGE_FINGER_X, NUDGE_FINGER_Y);
 
-    // Claude animation canvas
+    // DeskPet animation canvas
     nudge_anim_canvas = lv_canvas_create(nudge_overlay);
     lv_canvas_set_buffer(nudge_anim_canvas, nudge_anim_buf,
                          NUDGE_ANIM_W, NUDGE_ANIM_H, LV_COLOR_FORMAT_RGB565);
@@ -1021,11 +1208,6 @@ void ui_init(void) {
     init_light_screen(scr);
     init_pomodoro_screen(scr);
     splash_init(scr);
-
-    // Splash is touch-toggled — tap anywhere on the splash dismisses it
-    if (splash_get_root()) {
-        lv_obj_add_event_cb(splash_get_root(), global_click_cb, LV_EVENT_CLICKED, NULL);
-    }
 
     // Logo on top of all containers (inset for rounded corners)
     logo_img = lv_image_create(scr);
@@ -1170,13 +1352,16 @@ void ui_tick_clock(void) {
     lv_label_set_text_fmt(lbl_clock_secs, "%02d", cur % 60);
 }
 
-static screen_t prev_non_splash_screen = SCREEN_USAGE;
+static screen_t prev_non_splash_screen = SCREEN_CHAT;
 // Hide the battery indicator on the splash screen — the icon is visually
 // noisy over the pixel-art creature animations.
 static void apply_battery_visibility(void) {
     if (!battery_img) return;
-    if (current_screen == SCREEN_SPLASH) lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
-    else                                  lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    if (current_screen == SCREEN_SPLASH || current_screen == SCREEN_CHAT) {
+        lv_obj_add_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    } else {
+        lv_obj_clear_flag(battery_img, LV_OBJ_FLAG_HIDDEN);
+    }
 }
 
 // LVGL handles click debouncing internally. A tap anywhere on any
@@ -1198,7 +1383,6 @@ void ui_show_screen(screen_t screen) {
     switch (screen) {
     case SCREEN_SPLASH:
         splash_show();
-        ui_light_apply_clawd_rate(usage_rate_group());
         break;
     case SCREEN_USAGE:      lv_obj_clear_flag(usage_container, LV_OBJ_FLAG_HIDDEN); break;
     case SCREEN_COUNTDOWN:
@@ -1211,6 +1395,8 @@ void ui_show_screen(screen_t screen) {
         break;
     case SCREEN_CHAT:
         lv_obj_clear_flag(chat_container, LV_OBJ_FLAG_HIDDEN);
+        ble_chat_reset();
+        lv_label_set_text(chat_answer_label, "");
         chat_set_state(CHAT_STATE_LIST);
         break;
     case SCREEN_LIGHT:
@@ -1223,10 +1409,13 @@ void ui_show_screen(screen_t screen) {
     default: break;
     }
 
-    // Hide the logo overlay on the splash screen so the animation has a clean canvas
+    // Hide the logo overlay on Splash and Chat so those screens keep a clean canvas.
     if (logo_img) {
-        if (screen == SCREEN_SPLASH) lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
-        else                          lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        if (screen == SCREEN_SPLASH || screen == SCREEN_CHAT) {
+            lv_obj_add_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        } else {
+            lv_obj_clear_flag(logo_img, LV_OBJ_FLAG_HIDDEN);
+        }
     }
 
     if (screen != SCREEN_SPLASH) prev_non_splash_screen = screen;
@@ -1240,7 +1429,7 @@ void ui_cycle_screen(void) {
     case SCREEN_USAGE:     next = SCREEN_COUNTDOWN; break;
     case SCREEN_COUNTDOWN: next = SCREEN_CLOCK; break;
     case SCREEN_CLOCK:     next = SCREEN_CHAT; break;
-    case SCREEN_CHAT:      next = SCREEN_LIGHT; break;
+    case SCREEN_CHAT:      next = SCREEN_SPLASH; break;
     case SCREEN_LIGHT:     next = SCREEN_POMODORO; break;
     case SCREEN_POMODORO:  next = SCREEN_USAGE; break;
     default:               next = SCREEN_USAGE; break;
@@ -1258,6 +1447,9 @@ screen_t ui_get_current_screen(void) {
 }
 
 void ui_update_battery(int percent, bool charging) {
+    ui_battery_percent = percent;
+    ui_battery_charging = charging;
+
     int idx;
     if (charging) {
         idx = 4;  // charging icon
@@ -1274,6 +1466,10 @@ void ui_update_battery(int percent, bool charging) {
     }
     lv_image_set_src(battery_img, &battery_dscs[idx]);
     apply_battery_visibility();
+
+    if (current_screen == SCREEN_CHAT && chat_state == CHAT_STATE_LIST) {
+        chat_set_anim(chat_idle_anim_for_power());
+    }
 }
 
 static void finger_anim_xcb(void* var, int32_t val) {

@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+PYTHON="$SCRIPT_DIR/.venv/bin/python"
+if [ ! -x "$PYTHON" ]; then
+  PYTHON="python3"
+fi
+exec "$PYTHON" "$SCRIPT_DIR/voicectl.py" "$@"

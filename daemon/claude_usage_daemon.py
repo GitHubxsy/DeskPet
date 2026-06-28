@@ -11,7 +11,7 @@ from __future__ import annotations
 import asyncio
 import getpass
 import json
-import os
+import math
 import re
 import signal
 import subprocess
@@ -28,10 +28,18 @@ try:
 except ImportError:
     deepseek_chat = None
 
+from light_control import describe_intent, parse_light_text, run_light_command
+
 try:
-    from yeelight import Bulb
+    from voice_control import save_pcm16_wav, transcribe_pcm16
 except ImportError:
-    Bulb = None
+    save_pcm16_wav = None
+    transcribe_pcm16 = None
+
+try:
+    from tts_control import speak_text
+except ImportError:
+    speak_text = None
 
 DEVICE_NAME = "Clawdmeter"
 SERVICE_UUID = "4c41555a-4465-7669-6365-000000000001"
@@ -41,13 +49,16 @@ REQ_CHAR_UUID = "4c41555a-4465-7669-6365-000000000004"
 POLL_INTERVAL = 60
 TICK = 5
 SCAN_TIMEOUT = 8.0
+VOICE_MAX_BYTES = 240_000
+VOICE_IDLE_TIMEOUT = 1.2
+VOICE_MIN_PEAK = 64
+VOICE_TRANSCRIBE_TIMEOUT = 15.0
 
 # macOS: token lives in Keychain (service "Claude Code-credentials").
 # Linux: token lives in ~/.claude/.credentials.json.
 KEYCHAIN_SERVICE = "Claude Code-credentials"
 CREDENTIALS_PATH = Path.home() / ".claude" / ".credentials.json"
 SAVED_ADDR_FILE = Path.home() / ".config" / "claude-usage-monitor" / "ble-address"
-YEELIGHT_IP = os.environ.get("CLAWDMETER_YEELIGHT_IP", "192.168.5.117")
 
 API_URL = "https://api.anthropic.com/v1/messages"
 API_HEADERS_TEMPLATE = {
@@ -69,16 +80,49 @@ CHAT_QUESTIONS = [
     "Tell me a short joke",
     "Explain recursion simply",
     "What can you do?",
+    "Lamp soft green",
+    "Lamp warm white 60%",
+    "Lamp focus",
+    "Lamp off",
 ]
 CHAT_SYSTEM = (
     "You are CodePet, a tiny desk companion shown on a 480x480 screen. "
     "Answer in English using plain ASCII only, at most 3 short sentences. "
     "Be friendly and concise."
 )
+VOICE_CHAT_SYSTEM = (
+    "你是 Destpet，一只放在桌边的语音伙伴。用户刚通过 ESP32 说了一句话。"
+    "请用自然、简短的中文回答，最多两句话，不要 Markdown，不要反问太多。"
+)
+VOICE_AI_TIMEOUT = 35.0
 
 
 def log(msg: str) -> None:
     print(f"[{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def _pcm16_level(audio: bytes) -> tuple[int, int]:
+    sample_count = len(audio) // 2
+    if sample_count == 0:
+        return 0, 0
+    peak = 0
+    total_square = 0
+    for idx in range(0, sample_count * 2, 2):
+        sample = int.from_bytes(audio[idx : idx + 2], "little", signed=True)
+        level = abs(sample)
+        if level > peak:
+            peak = level
+        total_square += sample * sample
+    return peak, math.isqrt(total_square // sample_count)
+
+
+def _voice_error_text(exc: Exception) -> str:
+    message = str(exc).lower()
+    if "timed out" in message or "timeout" in message:
+        return "Voice timeout"
+    if "auth" in message or "401" in message or "403" in message:
+        return "Voice auth error"
+    return "Voice error"
 
 
 def _extract_access_token(blob: str) -> str | None:
@@ -176,7 +220,11 @@ def save_address(addr: str) -> None:
 
 async def scan_for_device() -> str | None:
     log(f"Scanning for '{DEVICE_NAME}' ({SCAN_TIMEOUT}s)...")
-    devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
+    try:
+        devices = await BleakScanner.discover(timeout=SCAN_TIMEOUT)
+    except BleakError as e:
+        log(f"Bluetooth scan unavailable: {e}")
+        return None
     for d in devices:
         if d.name == DEVICE_NAME:
             log(f"Found: {d.address}")
@@ -246,6 +294,13 @@ class Session:
         self.light_lock = asyncio.Lock()
         self.chat_busy = False
         self._chat_task: asyncio.Task | None = None
+        self.voice_pcm = bytearray()
+        self.voice_sample_rate = 16000
+        self.voice_channels = 1
+        self.voice_expected_seq = 0
+        self.voice_receiving = False
+        self.voice_last_packet_at = 0.0
+        self.voice_seq_jump_count = 0
 
     def _on_req(self, _char, data: bytearray) -> None:
         """REQ notify handler.
@@ -253,7 +308,8 @@ class Session:
         0x01 = refresh, 0x10+ = chat, 0x20 = open app,
         0x30/0x31 = light on/off, 0x32 + pct = brightness,
         0x33 + r/g/b = color, 0x34 + pct/r/g/b = scene,
-        0x35 = red alert flash.
+        0x35 = red alert flash, 0x40 + utf8 = text command,
+        0x50/0x51/0x52/0x53 = voice start/chunk/end/abort.
         """
         if not data:
             return
@@ -284,8 +340,85 @@ class Session:
             asyncio.create_task(self.handle_light("scene", (data[1], data[2], data[3], data[4])))
         elif code == 0x35:
             asyncio.create_task(self.handle_light("alert_red"))
+        elif code == 0x40 and len(data) > 1:
+            try:
+                text = bytes(data[1:]).decode("utf-8").strip()
+            except UnicodeDecodeError:
+                text = bytes(data[1:]).decode("utf-8", "ignore").strip()
+            self._chat_task = asyncio.create_task(
+                self.handle_chat_text(text, source="Text command")
+            )
+        elif code == 0x50:
+            self._voice_start(data)
+        elif code == 0x51 and len(data) > 3:
+            self._voice_chunk(data)
+        elif code == 0x52:
+            self._voice_finish("end")
+        elif code == 0x53:
+            reason = bytes(data[1:]).decode("utf-8", "ignore").strip()
+            self.voice_pcm.clear()
+            self.voice_receiving = False
+            log(f"Voice aborted by device: {reason or 'no reason'}")
+            self._chat_task = asyncio.create_task(
+                self._write(b"\x15Voice aborted")
+            )
         else:
             log(f"Unknown REQ code: {code:#x}")
+
+    def _voice_start(self, data: bytearray) -> None:
+        if len(data) >= 4:
+            self.voice_sample_rate = int(data[1]) | (int(data[2]) << 8)
+            self.voice_channels = max(1, int(data[3]))
+        else:
+            self.voice_sample_rate = 16000
+            self.voice_channels = 1
+        self.voice_pcm.clear()
+        self.voice_expected_seq = 0
+        self.voice_receiving = True
+        self.voice_last_packet_at = time.monotonic()
+        self.voice_seq_jump_count = 0
+        log(f"Voice start: {self.voice_sample_rate}Hz {self.voice_channels}ch")
+
+    def _voice_chunk(self, data: bytearray) -> None:
+        if not self.voice_receiving:
+            log("Voice chunk received without start; starting implicit recording")
+            self.voice_receiving = True
+            self.voice_last_packet_at = time.monotonic()
+        seq = int(data[1]) | (int(data[2]) << 8)
+        if seq != self.voice_expected_seq:
+            self.voice_seq_jump_count += 1
+            if self.voice_seq_jump_count <= 5 or self.voice_seq_jump_count % 25 == 0:
+                log(f"Voice chunk sequence jump: expected {self.voice_expected_seq}, got {seq}")
+        self.voice_expected_seq = (seq + 1) & 0xFFFF
+        if len(self.voice_pcm) + len(data) - 3 > VOICE_MAX_BYTES:
+            self.voice_pcm.clear()
+            self.voice_receiving = False
+            log("Voice audio too large; dropping recording")
+            return
+        self.voice_pcm.extend(data[3:])
+        self.voice_last_packet_at = time.monotonic()
+
+    def _voice_finish(self, reason: str) -> None:
+        if not self.voice_receiving and not self.voice_pcm:
+            log(f"Voice finish ignored ({reason}): no recording")
+            return
+        audio = bytes(self.voice_pcm)
+        sample_rate = self.voice_sample_rate
+        channels = self.voice_channels
+        jumps = self.voice_seq_jump_count
+        self.voice_pcm.clear()
+        self.voice_receiving = False
+        self.voice_seq_jump_count = 0
+        log(f"Voice finish ({reason}): {len(audio)} bytes, seq_jumps={jumps}")
+        self._chat_task = asyncio.create_task(
+            self.handle_voice_audio(audio, sample_rate, channels)
+        )
+
+    async def tick_voice_timeout(self) -> None:
+        if not self.voice_receiving:
+            return
+        if time.monotonic() - self.voice_last_packet_at >= VOICE_IDLE_TIMEOUT:
+            self._voice_finish("idle-timeout")
 
     async def setup_refresh_subscription(self) -> None:
         try:
@@ -308,128 +441,197 @@ class Session:
         return await self._write(data)
 
     async def handle_chat(self, idx: int) -> None:
-        """Answer a preset question via DeepSeek, streamed back in chunks.
+        """Answer a preset question selected by the device."""
+        if not 0 <= idx < len(CHAT_QUESTIONS):
+            log(f"Bad chat index: {idx}")
+            return
+        await self.handle_chat_text(CHAT_QUESTIONS[idx], source="Chat request")
+
+    async def handle_chat_text(self, text: str, source: str = "Chat request") -> None:
+        """Answer free text, streamed back in chunks.
 
         Chunks are tagged on the RX characteristic: 0x02 = text chunk,
         0x04 = response complete, 0x15 = error.
         """
         if self.chat_busy:
             log("Chat already in progress; ignoring request")
+            await self._write(b"\x15Busy")
             return
-        if not 0 <= idx < len(CHAT_QUESTIONS):
-            log(f"Bad chat index: {idx}")
+        if not text:
+            log(f"{source}: empty")
+            await self._write(b"\x15Empty command")
             return
         self.chat_busy = True
-        question = CHAT_QUESTIONS[idx]
-        log(f"Chat request: {question}")
         try:
-            if deepseek_chat is None:
-                await self._write(b"\x15AI module unavailable")
-                return
-            messages = [
-                {"role": "system", "content": CHAT_SYSTEM},
-                {"role": "user", "content": question},
-            ]
-            try:
-                answer = await asyncio.to_thread(deepseek_chat.chat, messages)
-            except Exception as e:  # noqa: BLE001
-                log(f"DeepSeek call failed: {e}")
-                msg = f"AI error: {e}"[:200]
-                await self._write(b"\x15" + msg.encode("ascii", "ignore"))
-                return
-            answer = _ascii_clean(answer).strip() or "(no answer)"
-            log(f"Chat answer: {len(answer)} chars")
-            chunk = 160
-            for i in range(0, len(answer), chunk):
-                piece = answer[i:i + chunk].encode("ascii", "ignore")
-                await self._write(b"\x02" + piece)
-            await self._write(b"\x04")
+            await self._handle_chat_text_unlocked(text, source)
         finally:
             self.chat_busy = False
+
+    async def _handle_chat_text_unlocked(self, text: str, source: str) -> None:
+        log(f"{source}: {text}")
+        if await self._handle_light_chat(text):
+            return
+
+        if deepseek_chat is None:
+            await self._write(b"\x15AI module unavailable")
+            return
+        messages = [
+            {"role": "system", "content": CHAT_SYSTEM},
+            {"role": "user", "content": text},
+        ]
+        try:
+            answer = await asyncio.to_thread(deepseek_chat.chat, messages)
+        except Exception as e:  # noqa: BLE001
+            log(f"DeepSeek call failed: {e}")
+            msg = f"AI error: {e}"[:200]
+            await self._write(b"\x15" + msg.encode("ascii", "ignore"))
+            return
+        await self._send_chat_answer(answer)
+
+    async def handle_voice_audio(self, audio: bytes, sample_rate: int, channels: int) -> None:
+        if self.chat_busy:
+            log("Chat already in progress; ignoring voice recording")
+            await self._write(b"\x15Busy")
+            return
+        if transcribe_pcm16 is None:
+            await self._write(b"\x15Voice module unavailable")
+            return
+        if len(audio) < 1600:
+            log(f"Voice audio too short: {len(audio)} bytes")
+            await self._write(b"\x15Voice too short")
+            await asyncio.sleep(3)
+            await self._send_speech_done()
+            return
+
+        self.chat_busy = True
+        try:
+            log(f"Voice audio: {len(audio)} bytes, {sample_rate}Hz, {channels}ch")
+            peak, rms = _pcm16_level(audio)
+            log(f"Voice level: peak={peak} rms={rms}")
+            if save_pcm16_wav is not None:
+                try:
+                    save_pcm16_wav(
+                        Path.home() / ".clawdmeter-daemon" / "last_voice.wav",
+                        audio,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                    )
+                except Exception as e:  # noqa: BLE001
+                    log(f"Saving voice debug wav failed: {e}")
+            if peak < VOICE_MIN_PEAK:
+                await self._write(b"\x15Voice too quiet")
+                return
+            try:
+                text = await asyncio.wait_for(
+                    asyncio.to_thread(
+                        transcribe_pcm16,
+                        audio,
+                        sample_rate=sample_rate,
+                        channels=channels,
+                    ),
+                    timeout=VOICE_TRANSCRIBE_TIMEOUT,
+                )
+            except asyncio.TimeoutError:
+                log("Voice transcription timed out")
+                await self._write(b"\x15Voice timeout")
+                return
+            except Exception as e:  # noqa: BLE001
+                log(f"Voice transcription failed: {e}")
+                msg = _voice_error_text(e)
+                await self._write(b"\x15" + msg.encode("ascii", "ignore"))
+                return
+
+            text = text.strip()
+            if not text:
+                await self._write(b"\x15Voice empty")
+                return
+            log(f"Voice transcript: {text}")
+            if await self._handle_light_chat(text):
+                return
+            await self._handle_voice_chat_reply(text)
+        finally:
+            self.chat_busy = False
+
+    async def _handle_voice_chat_reply(self, text: str) -> None:
+        if deepseek_chat is None:
+            await self._write(b"\x15AI module unavailable")
+            return
+        if speak_text is None:
+            await self._write(b"\x15TTS module unavailable")
+            return
+
+        messages = [
+            {"role": "system", "content": VOICE_CHAT_SYSTEM},
+            {"role": "user", "content": text},
+        ]
+        try:
+            answer = await asyncio.wait_for(
+                asyncio.to_thread(deepseek_chat.chat, messages),
+                timeout=VOICE_AI_TIMEOUT,
+            )
+        except asyncio.TimeoutError:
+            log("Voice AI reply timed out")
+            await self._write(b"\x15AI timeout")
+            return
+        except Exception as e:  # noqa: BLE001
+            log(f"Voice AI reply failed: {e}")
+            await self._write(b"\x15AI error")
+            return
+
+        answer = answer.strip()
+        if not answer:
+            await self._write(b"\x15AI empty")
+            return
+        log(f"Voice AI answer: {answer[:200]}")
+        display_text = _ascii_clean(answer).strip()
+        await self._send_chat_answer(display_text if display_text else "Speaking...")
+        try:
+            await asyncio.to_thread(speak_text, answer, logger=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"TTS failed: {e}")
+        finally:
+            await self._send_speech_done()
+
+    async def _handle_light_chat(self, text: str) -> bool:
+        try:
+            intent = parse_light_text(text)
+        except ValueError:
+            return False
+
+        try:
+            async with self.light_lock:
+                await asyncio.to_thread(run_light_command, intent.action, intent.value, logger=log)
+        except Exception as e:  # noqa: BLE001
+            log(f"Light chat command failed: {e}")
+            msg = f"Lamp error: {e}"[:200]
+            await self._write(b"\x15" + msg.encode("ascii", "ignore"))
+            return True
+
+        answer = f"Lamp done: {describe_intent(intent)}"
+        log(answer)
+        await self._send_chat_answer(answer)
+        await self._send_speech_done()
+        return True
+
+    async def _send_chat_answer(self, answer: str) -> None:
+        answer = _ascii_clean(answer).strip() or "(no answer)"
+        log(f"Chat answer: {len(answer)} chars")
+        chunk = 160
+        for i in range(0, len(answer), chunk):
+            piece = answer[i:i + chunk].encode("ascii", "ignore")
+            await self._write(b"\x02" + piece)
+        await self._write(b"\x04")
+
+    async def _send_speech_done(self) -> None:
+        log("Voice speech done")
+        await self._write(b"\x05")
 
     async def handle_light(self, action: str, value=None) -> None:
         async with self.light_lock:
             try:
-                await asyncio.to_thread(_run_light_command, action, value)
+                await asyncio.to_thread(run_light_command, action, value, logger=log)
             except Exception as e:  # noqa: BLE001
                 log(f"Light command failed ({action}): {e}")
-
-
-def _run_light_command(action: str, value=None) -> None:
-    if Bulb is None:
-        raise RuntimeError("yeelight package is not installed")
-
-    bulb = Bulb(YEELIGHT_IP)
-    if action == "on":
-        bulb.turn_on()
-        log(f"Light on: {YEELIGHT_IP}")
-    elif action == "off":
-        bulb.turn_off()
-        log(f"Light off: {YEELIGHT_IP}")
-    elif action == "brightness":
-        pct = int(value or 50)
-        pct = max(1, min(100, pct))
-        bulb.turn_on()
-        bulb.set_brightness(pct)
-        log(f"Light brightness {pct}%: {YEELIGHT_IP}")
-    elif action == "color":
-        r, g, b = value
-        r = max(0, min(255, int(r)))
-        g = max(0, min(255, int(g)))
-        b = max(0, min(255, int(b)))
-        bulb.turn_on()
-        bulb.set_rgb(r, g, b)
-        log(f"Light color #{r:02x}{g:02x}{b:02x}: {YEELIGHT_IP}")
-    elif action == "scene":
-        brightness, r, g, b = value
-        pct = max(1, min(100, int(brightness)))
-        r = max(0, min(255, int(r)))
-        g = max(0, min(255, int(g)))
-        b = max(0, min(255, int(b)))
-        bulb.turn_on()
-        bulb.set_rgb(r, g, b)
-        bulb.set_brightness(pct)
-        log(f"Light scene {pct}% #{r:02x}{g:02x}{b:02x}: {YEELIGHT_IP}")
-    elif action == "alert_red":
-        _flash_red_alert(bulb)
-    else:
-        raise ValueError(f"unknown light action {action!r}")
-
-
-def _flash_red_alert(bulb) -> None:
-    props = {}
-    try:
-        props = bulb.get_properties(["power", "bright", "rgb"])
-    except Exception as e:  # noqa: BLE001
-        log(f"Light alert restore snapshot failed: {e}")
-
-    was_on = props.get("power") == "on"
-    prev_bright = _parse_int(props.get("bright") or props.get("current_brightness"), 50)
-    prev_rgb = _parse_int(props.get("rgb"), None)
-
-    bulb.turn_on()
-    bulb.set_rgb(255, 0, 0)
-    bulb.set_brightness(100)
-    time.sleep(0.35)
-
-    if not was_on:
-        bulb.turn_off()
-        log(f"Light red alert flashed, restored off: {YEELIGHT_IP}")
-        return
-
-    if prev_rgb is not None:
-        bulb.set_rgb((prev_rgb >> 16) & 0xFF, (prev_rgb >> 8) & 0xFF, prev_rgb & 0xFF)
-    bulb.set_brightness(max(1, min(100, prev_bright)))
-    log(f"Light red alert flashed, restored on: {YEELIGHT_IP}")
-
-
-def _parse_int(value, default):
-    try:
-        if value is None:
-            return default
-        return int(value)
-    except (TypeError, ValueError):
-        return default
 
 
 def _notify_quota_refresh(label: str) -> None:
@@ -482,6 +684,7 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
     prev_w: int | None = None
     try:
         while client.is_connected and not stop_event.is_set():
+            await session.tick_voice_timeout()
             now = time.time()
             elapsed = now - last_poll
             if session.refresh_requested.is_set() or elapsed >= POLL_INTERVAL:
@@ -503,7 +706,8 @@ async def connect_and_run(address: str, stop_event: asyncio.Event) -> bool:
                             prev_s, prev_w = cur_s, cur_w
 
             try:
-                await asyncio.wait_for(session.refresh_requested.wait(), timeout=TICK)
+                timeout = 0.25 if session.voice_receiving else TICK
+                await asyncio.wait_for(session.refresh_requested.wait(), timeout=timeout)
             except asyncio.TimeoutError:
                 pass
     finally:

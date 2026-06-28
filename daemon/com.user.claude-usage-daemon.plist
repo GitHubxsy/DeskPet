@@ -38,6 +38,30 @@
         <string>__HOME__</string>
         <key>PATH</key>
         <string>/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+        <key>DEEPSEEK_API_KEY</key>
+        <string>__DEEPSEEK_API_KEY__</string>
+        <key>OPENAI_API_KEY</key>
+        <string>__OPENAI_API_KEY__</string>
+        <key>TRANSCRIBE_PROVIDER</key>
+        <string>__TRANSCRIBE_PROVIDER__</string>
+        <key>DASHSCOPE_API_HOST</key>
+        <string>__DASHSCOPE_API_HOST__</string>
+        <key>DASHSCOPE_API_KEY</key>
+        <string>__DASHSCOPE_API_KEY__</string>
+        <key>DASHSCOPE_COMPATIBLE_BASE_URL</key>
+        <string>__DASHSCOPE_COMPATIBLE_BASE_URL__</string>
+        <key>DASHSCOPE_TRANSCRIBE_MODE</key>
+        <string>__DASHSCOPE_TRANSCRIBE_MODE__</string>
+        <key>DASHSCOPE_TRANSCRIBE_MODEL</key>
+        <string>__DASHSCOPE_TRANSCRIBE_MODEL__</string>
+        <key>DASHSCOPE_ASR_LANGUAGE</key>
+        <string>__DASHSCOPE_ASR_LANGUAGE__</string>
+        <key>DASHSCOPE_TRANSCRIBE_TIMEOUT</key>
+        <string>__DASHSCOPE_TRANSCRIBE_TIMEOUT__</string>
+        <key>DASHSCOPE_TTS_MODEL</key>
+        <string>__DASHSCOPE_TTS_MODEL__</string>
+        <key>DASHSCOPE_TTS_VOICE</key>
+        <string>__DASHSCOPE_TTS_VOICE__</string>
     </dict>
 </dict>
 </plist>

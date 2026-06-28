@@ -10,11 +10,13 @@
 #include "imu.h"
 #include "splash.h"
 #include "usage_rate.h"
+#include "voice.h"
+#include "deskpet_anim.h"
 
 // Physical buttons (global, screen-independent):
-//   BTN_BACK   (GPIO 0)  — left,  send Space (Claude Code voice mode push-to-talk)
+//   BTN_BACK   (GPIO 0)  — left, enter Ask; hold on Ask for voice
 //   BTN_FWD    (GPIO 18) — right, send Shift+Tab (Claude Code mode toggle)
-//   AXP PWR    (PMU)     — middle, cycle screens; on splash, cycle animations
+//   AXP PWR    (PMU)     — middle, cycle screens
 #define BTN_BACK 0
 #define BTN_FWD  18
 
@@ -220,6 +222,14 @@ static void check_serial_cmd() {
             cmd_buf[cmd_pos] = '\0';
             if (strcmp(cmd_buf, "screenshot") == 0) {
                 send_screenshot();
+            } else if (strncmp(cmd_buf, "deskpet ", 8) == 0) {
+                int id = atoi(cmd_buf + 8);
+                if (id >= 0 && id < DESKPET_ANIM_COUNT) {
+                    ui_chat_debug_set_anim(id);
+                    Serial.printf("DESKPET_ANIM %d %s\n", id, deskpet_anim_name(id));
+                } else {
+                    Serial.println("DESKPET_ANIM_ERR");
+                }
             }
             cmd_pos = 0;
         } else if (cmd_pos < CMD_BUF_SIZE - 1) {
@@ -286,6 +296,9 @@ void setup() {
     // Init BLE data channel
     ble_init();
 
+    // Init the on-board ES7210 microphone path for Ask-page voice commands.
+    voice_init();
+
     // Physical buttons: back (GPIO 0) and forward (GPIO 18)
     pinMode(BTN_BACK, INPUT_PULLUP);
     pinMode(BTN_FWD,  INPUT_PULLUP);
@@ -339,23 +352,42 @@ void loop() {
     ui_tick_chat();
     ui_tick_pomodoro();
     ui_tick_nudge();
+    voice_tick();
     ble_tick();
     power_tick();
     imu_tick();
     splash_tick();
 
     // Three-button input (global, screen-independent):
-    //   LEFT  (GPIO 0)  → Space (voice-mode push-to-talk; press & release tracked)
+    //   LEFT  (GPIO 0)  → Ask page; hold on Ask to record voice
     //   RIGHT (GPIO 18) → Shift+Tab (Claude Code mode toggle)
-    //   PWR   (AXP)     → cycle screens; on splash, cycle animations
+    //   PWR   (AXP)     → cycle screens
     {
         static bool back_was = false, fwd_was = false;
+        static bool back_chat_mode = false;
+        static bool back_voice_started = false;
         bool back_now = (digitalRead(BTN_BACK) == LOW);
         bool fwd_now  = (digitalRead(BTN_FWD)  == LOW);
 
         if (back_now != back_was) {
-            if (back_now) ble_keyboard_press(0x2C, 0);  // HID Space, no mods
-            else          ble_keyboard_release();
+            if (back_now) {
+                if (ui_get_current_screen() == SCREEN_CHAT) {
+                    back_chat_mode = true;
+                    ui_chat_voice_press();
+                    back_voice_started = voice_start();
+                } else {
+                    back_chat_mode = false;
+                    back_voice_started = false;
+                    ui_show_screen(SCREEN_CHAT);
+                }
+            } else {
+                if (back_chat_mode) {
+                    if (back_voice_started) voice_stop();
+                    ui_chat_voice_release(back_voice_started);
+                }
+                back_chat_mode = false;
+                back_voice_started = false;
+            }
             back_was = back_now;
         }
         if (fwd_now != fwd_was) {
@@ -365,8 +397,7 @@ void loop() {
         }
 
         if (power_pwr_pressed()) {
-            if (ui_get_current_screen() == SCREEN_SPLASH) splash_next();
-            else if (ui_get_current_screen() == SCREEN_POMODORO && ui_pomodoro_is_active()) {
+            if (ui_get_current_screen() == SCREEN_POMODORO && ui_pomodoro_is_active()) {
                 ui_pomodoro_stop();
             }
             else ui_cycle_screen();
@@ -398,10 +429,8 @@ void loop() {
             if (g_after != g_before) {
                 Serial.printf("usage rate: group %d -> %d (s=%.2f%%)\n",
                     g_before, g_after, usage.session_pct);
-                if (splash_is_active()) splash_pick_for_current_rate();
             }
             ui_update(&usage);
-            if (splash_is_active()) ui_light_apply_clawd_rate(g_after);
             ble_send_ack();
         } else {
             ble_send_nack();
